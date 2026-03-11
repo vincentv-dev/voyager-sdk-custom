@@ -3,9 +3,9 @@
 SuperPoint inference using axelera.runtime directly (bypasses GStreamer).
 
 Uses 4 parallel AIPU workers + pipelining to approach hardware throughput.
-Must be run from /home/vverkoren/Documents/Vydar/voyager-sdk with venv active:
+Must be run from /home/name/Documents/Vydar/voyager-sdk with venv active:
 
-    cd /home/vverkoren/Documents/Vydar/voyager-sdk
+    cd /home/name/Documents/Vydar/voyager-sdk
     source venv/bin/activate
     python3 ../SuperPoint/inference_superpoint_fast.py --video media/traffic1_1080p.mp4 --no-display
 """
