@@ -30,7 +30,7 @@ models:
   superpoint-onnx:
     class: SuperPointONNXModel
     class_path: $AXELERA_FRAMEWORK/ax_models/custom/superpoint/superpoint_model.py
-    weight_path: /home/vverkoren/Documents/Vydar/SuperPoint/weights/superpoint.onnx
+    weight_path: /home/vverkoren/Documents/Vydar/SuperPoint/weights/superpoint.onnx # This path should be changed according to your local setup
     task_category: KeypointDetection
     input_tensor_layout: NCHW
     input_tensor_shape: [1, 1, 480, 640]
