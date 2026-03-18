@@ -1,0 +1,16 @@
+model=build/yolov8s-coco-onnx/yolov8s-coco-onnx/4/model.json
+devices=metis-0:3:0
+double_buffer=True
+dmabuf_inputs=True
+dmabuf_outputs=True
+num_children=0
+preprocess0_lib=libtransform_resize_cl.so
+preprocess0_options=width:640;height:640;padding:114;letterbox:1;scale_up:1;to_tensor:1;mean:0.,0.,0.;std:1.,1.,1.;quant_scale:0.003921568859368563;quant_zeropoint:-128.0
+preprocess1_lib=libtransform_padding.so
+preprocess1_options=padding:0,0,1,1,1,15,0,0;fill:-128
+preprocess1_batch=4
+postprocess0_lib=libdecode_yolov8.so
+postprocess0_options=meta_key:detections;classes:80;confidence_threshold:0.25;scales:0.07315773516893387,0.06728368997573853,0.0699247345328331,0.09558890759944916,0.15929509699344635,0.1788596361875534;padding:0,0,0,0,0,0,0,0|0,0,0,0,0,0,0,0|0,0,0,0,0,0,0,0|0,0,0,0,0,0,0,48|0,0,0,0,0,0,0,48|0,0,0,0,0,0,0,48;zero_points:-61,-59,-45,144,104,100;topk:30000;multiclass:0;model_width:640;model_height:640;scale_up:1;letterbox:1
+postprocess0_mode=read
+postprocess1_lib=libinplace_nms.so
+postprocess1_options=meta_key:detections;max_boxes:300;nms_threshold:0.45;class_agnostic:1;location:CPU

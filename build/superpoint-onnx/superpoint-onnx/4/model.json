@@ -1,0 +1,159 @@
+{
+  "name": "kernel_function_batched",
+  "type": "default",
+  "version": "4.0",
+  "generation": "omega",
+  "memory_pools": [
+    {
+      "name": "pool_ddr_const",
+      "size": 6905856,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 1,
+      "blob_file": "pool_ddr_const.bin"
+    },
+    {
+      "name": "pool_ddr_input",
+      "size": 79217664,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 2
+    },
+    {
+      "name": "pool_ddr_output",
+      "size": 7372800,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 2
+    },
+    {
+      "name": "pool_l2_const",
+      "size": 28672,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1,
+      "blob_file": "pool_l2_const.bin"
+    },
+    {
+      "name": "pool_l2_0",
+      "size": 5963776,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1
+    },
+    {
+      "name": "pool_l2_1",
+      "size": 5963776,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1
+    },
+    {
+      "name": "pool_l2_2",
+      "size": 5963776,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1
+    },
+    {
+      "name": "pool_l2_3",
+      "size": 5963776,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1
+    }
+  ],
+  "inputs": [
+    {
+      "name": "var_input_ifd0",
+      "memory_pool": "pool_ddr_input",
+      "offset": 0,
+      "size": 79217664,
+      "shape": [
+        4,
+        482,
+        642,
+        64
+      ],
+      "dtype": "int8"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "output_mmio_var",
+      "memory_pool": "pool_ddr_output",
+      "offset": 0,
+      "size": 4915200,
+      "shape": [
+        4,
+        60,
+        80,
+        256
+      ],
+      "dtype": "int8"
+    },
+    {
+      "name": "output_mmio_var_1",
+      "memory_pool": "pool_ddr_output",
+      "offset": 4915200,
+      "size": 2457600,
+      "shape": [
+        4,
+        60,
+        80,
+        128
+      ],
+      "dtype": "int8"
+    }
+  ],
+  "kernels": [
+    {
+      "name": "kernel_function_0",
+      "arguments": [
+        "pool_ddr_const",
+        "pool_ddr_input",
+        "pool_ddr_output",
+        "pool_l2_0",
+        "pool_l2_const"
+      ],
+      "pipeline_stage": 0,
+      "source_file": "kernel_function_0.c"
+    },
+    {
+      "name": "kernel_function_1",
+      "arguments": [
+        "pool_ddr_const",
+        "pool_ddr_input",
+        "pool_ddr_output",
+        "pool_l2_1",
+        "pool_l2_const"
+      ],
+      "pipeline_stage": 0,
+      "source_file": "kernel_function_1.c"
+    },
+    {
+      "name": "kernel_function_2",
+      "arguments": [
+        "pool_ddr_const",
+        "pool_ddr_input",
+        "pool_ddr_output",
+        "pool_l2_2",
+        "pool_l2_const"
+      ],
+      "pipeline_stage": 0,
+      "source_file": "kernel_function_2.c"
+    },
+    {
+      "name": "kernel_function_3",
+      "arguments": [
+        "pool_ddr_const",
+        "pool_ddr_input",
+        "pool_ddr_output",
+        "pool_l2_3",
+        "pool_l2_const"
+      ],
+      "pipeline_stage": 0,
+      "source_file": "kernel_function_3.c"
+    }
+  ]
+}
