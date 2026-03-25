@@ -1,0 +1,6 @@
+/home/Vydar/voyager-sdk-custom/examples/bin/axinferencenet_example
+/home/Vydar/voyager-sdk-custom/examples/bin/axinferencenet_tensor
+/home/Vydar/voyager-sdk-custom/examples/bin/axinferencenet_cascaded
+/home/Vydar/voyager-sdk-custom/examples/bin/axinferencenet_tracker
+/home/Vydar/voyager-sdk-custom/examples/bin/axruntime_example
+/home/Vydar/voyager-sdk-custom/examples/bin/axruntime_example.py

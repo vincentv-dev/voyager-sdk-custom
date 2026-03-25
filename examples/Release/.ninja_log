@@ -1,0 +1,12 @@
+# ninja log v5
+5	31397	1773846295473845604	axruntime/CMakeFiles/axruntime_example.dir/axruntime_example.cpp.o	18e8b65bc6b3c6e5
+31404	35251	1773846299309930334	axruntime/axruntime_example	e8d227db7d823c78
+2	49359	1773846313430242219	axinferencenet/CMakeFiles/axinferencenet_cascaded.dir/axinferencenet_cascaded.cpp.o	cc517c4dc2526d80
+1	49671	1773846313738249023	axinferencenet/CMakeFiles/axinferencenet_example.dir/axinferencenet_example.cpp.o	dffc643974f48b42
+49675	52586	1773846316638313078	axinferencenet/axinferencenet_example	d3d2c514a69a9a2c
+49375	52701	1773846316758315729	axinferencenet/axinferencenet_cascaded	c479e19a8367dbef
+1	53253	1773846317326331557	axinferencenet/CMakeFiles/axinferencenet_tensor.dir/axinferencenet_tensor.cpp.o	8ff9c6f066bffa84
+53254	55645	1773846319702407976	axinferencenet/axinferencenet_tensor	985574ef5ba18098
+3	57479	1773846321550467261	axinferencenet/CMakeFiles/axinferencenet_tracker.dir/axinferencenet_tracker.cpp.o	4ef0cad0bc571adf
+57480	59770	1773846323826540101	axinferencenet/axinferencenet_tracker	78cb54d9ad2de77e
+59770	59804	0	CMakeFiles/install.util	519ed45ab77db96e

@@ -7,3 +7,4 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(axinferencenet)
 add_subdirectory(axruntime)
+add_subdirectory(superpoint)

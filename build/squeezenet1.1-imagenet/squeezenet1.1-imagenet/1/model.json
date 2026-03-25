@@ -1,0 +1,72 @@
+{
+  "name": "kernel_function",
+  "type": "default",
+  "version": "4.0",
+  "generation": "omega",
+  "memory_pools": [
+    {
+      "name": "pool_ddr_input",
+      "size": 200704,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 2
+    },
+    {
+      "name": "pool_ddr_output",
+      "size": 1024,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 2
+    },
+    {
+      "name": "pool_l2_const",
+      "size": 3080704,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1,
+      "blob_file": "pool_l2_const.bin"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "var_input_ifd0",
+      "memory_pool": "pool_ddr_input",
+      "offset": 0,
+      "size": 200704,
+      "shape": [
+        1,
+        224,
+        224,
+        4
+      ],
+      "dtype": "int8"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "output_mmio_var",
+      "memory_pool": "pool_ddr_output",
+      "offset": 0,
+      "size": 1024,
+      "shape": [
+        1,
+        1,
+        1,
+        1024
+      ],
+      "dtype": "int8"
+    }
+  ],
+  "kernels": [
+    {
+      "name": "kernel_function",
+      "arguments": [
+        "pool_ddr_input",
+        "pool_ddr_output",
+        "pool_l2_const"
+      ],
+      "pipeline_stage": 0,
+      "source_file": "kernel_function.c"
+    }
+  ]
+}

@@ -66,8 +66,10 @@ def insert_color_convert(gst, format, vaapi=False, opencl=False, opencv=True):
             gst.videoconvert()
             gst.axinplace()
     elif bool(opencv) is True:
+        # libtransform_colorconvert.so uses 'gray', not 'gray8'
+        elem_fmt = 'gray' if format.lower() == 'gray' else color_format.lower()
         gst.axtransform(
-            lib="libtransform_colorconvert.so", options=f'format:{color_format.lower()}'
+            lib="libtransform_colorconvert.so", options=f'format:{elem_fmt}'
         )
     else:
         gst.videoconvert()

@@ -1,0 +1,56 @@
+{
+  "name": "superpoint-gst",
+  "task_category": "KeypointDetection",
+  "input_tensor_shape": [
+    1,
+    1,
+    480,
+    640
+  ],
+  "input_color_format": "GRAY",
+  "input_tensor_layout": "NCHW",
+  "num_classes": 1,
+  "labels": [],
+  "label_filter": [],
+  "output_info": [
+    {
+      "shape": [
+        1,
+        1,
+        480,
+        640
+      ],
+      "name": "score_map",
+      "dtype": "tensor(float)"
+    },
+    {
+      "shape": [
+        1,
+        256,
+        60,
+        80
+      ],
+      "name": "desc_norm",
+      "dtype": "tensor(float)"
+    }
+  ],
+  "model_type": "DEEP_LEARNING",
+  "weight_path": "/home/Vydar/voyager-sdk-custom/ax_models/custom/superpoint-gst/weights/superpoint_encoder.onnx",
+  "weight_url": "",
+  "weight_md5": "",
+  "prequantized_path": "",
+  "prequantized_url": "",
+  "prequantized_md5": "",
+  "precompiled_path": "",
+  "precompiled_url": "",
+  "precompiled_md5": "",
+  "dataset": "SuperPointCalibDataset",
+  "base_dir": "",
+  "class_name": "AxONNXModel",
+  "class_path": "ax_models/base_onnx.py",
+  "version": "",
+  "extra_kwargs": {
+    "aipu_cores": 1,
+    "max_compiler_cores": 1
+  }
+}
