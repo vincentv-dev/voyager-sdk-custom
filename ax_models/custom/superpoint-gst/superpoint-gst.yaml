@@ -8,8 +8,14 @@ description: >
 
   The VGG-style CNN backbone + detector head + descriptor head run on the
   Axelera Metis M2 AIPU, including softmax, pixel-shuffle, max-pool NMS,
-  and L2-normalisation of the descriptor map.  The host CPU only performs
-  keypoint extraction (threshold + top-k) and bilinear descriptor sampling.
+  border masking, TopK keypoint extraction, bilinear descriptor sampling,
+  and L2-normalisation.  The host CPU only applies a score threshold to
+  discard zero-padded slots from the fixed-K ONNX outputs.
+
+  Compile-time parameters (baked into the ONNX graph at export):
+    max_keypoints (default 1024), remove_borders (default 4), nms_radius (default 4)
+  Runtime parameters (set here in YAML):
+    detection_threshold
 
   Prerequisites:
     1. Export the ONNX encoder once (from the voyager-sdk root):
@@ -29,24 +35,26 @@ pipeline:
       model_name: superpoint-gst
       input:
         type: image
-        color_format: GRAY
+        color_format: RGB
       preprocess:
         # Resize to the fixed shape the AIPU model was compiled for.
         # Both dimensions must be divisible by 8 (SuperPoint stride = 8).
         - resize:
             width: 640
             height: 480
-        # Convert HxWx1 uint8 → 1x1xHxW float32 in [0, 1]
+        # Convert HxWxC uint8 → 1x3xHxW float32 in [0, 1]
         - torch-totensor:
       inference:
-        # handle_all: true  →  the SDK dequantizes + transposes the AIPU outputs
-        # so exec_torch receives clean float32 tensors matching the original model.
-        handle_all: true
+        # handle_all: false  →  the SDK skips the paddingdequantize element entirely.
+        # The C++ decoder receives raw INT8 NHWC tensors from the AIPU and handles
+        # all post-processing (NMS, TopK, descriptor sampling) in fixed-point.
+        # exec_torch (Python) is unaffected — ORT runs the full ONNX graph in float32.
+        handle_all: false
       postprocess:
         - superpoint-decoder:
             detection_threshold: 0.005
             remove_borders: 4
-            max_keypoints: 1024   # set to -1 for unlimited keypoints
+            max_keypoints: 512
 
 operators:
   superpoint-decoder:
@@ -61,8 +69,8 @@ models:
     weight_path: $AXELERA_FRAMEWORK/ax_models/custom/superpoint-gst/weights/superpoint_encoder.onnx
     task_category: KeypointDetection
     input_tensor_layout: NCHW
-    input_tensor_shape: [1, 1, 480, 640]
-    input_color_format: GRAY
+    input_tensor_shape: [1, 3, 480, 640]
+    input_color_format: RGB
     dataset: SuperPointCalibDataset
     extra_kwargs:
       aipu_cores: 1

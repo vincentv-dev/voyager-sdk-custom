@@ -76,7 +76,7 @@ def _batched_nms(scores: torch.Tensor, nms_radius: int) -> torch.Tensor:
 
 def _old_postprocess(scores_logits, desc_map_raw,
                      nms_radius=4, threshold=0.005,
-                     remove_borders=4, max_keypoints=1024):
+                     remove_borders=4, max_keypoints=512):
     """Full old pipeline: softmax → pixel-shuffle → batched NMS → kpts → descs."""
     s = F.softmax(scores_logits, dim=1)[:, :-1]   # [1, 64, Hf, Wf]
     b, _, hf, wf = s.shape
@@ -116,33 +116,22 @@ def _old_postprocess(scores_logits, desc_map_raw,
     return kpts.cpu().numpy(), kpt_scores.cpu().numpy(), descs.cpu().numpy()
 
 
-def _new_postprocess(score_map, desc_norm,
-                     threshold=0.005, remove_borders=4, max_keypoints=1024):
-    """New pipeline: score_map already NMS-suppressed; just extract kpts."""
-    scores_2d = score_map.squeeze(0).squeeze(0).clone()
+def _new_postprocess(keypoints, scores, descriptors, threshold=0.005):
+    """New pipeline: unpack pre-computed ONNX outputs and threshold-filter."""
+    # keypoints:   [1, K, 2]   (x, y) pixel coords, sorted by score descending
+    # scores:      [1, K]
+    # descriptors: [1, K, 256]
+    kpts  = keypoints[0]     # [K, 2]
+    scr   = scores[0]        # [K]
+    descs = descriptors[0]   # [K, 256]
 
-    pad = remove_borders
-    if pad > 0:
-        scores_2d[:pad] = 0; scores_2d[-pad:] = 0
-        scores_2d[:, :pad] = 0; scores_2d[:, -pad:] = 0
+    if threshold > 0:
+        mask  = scr > threshold
+        kpts  = kpts[mask]
+        scr   = scr[mask]
+        descs = descs[mask]
 
-    row, col = torch.where(scores_2d > threshold)
-    kpts = torch.stack([col, row], dim=-1).float()
-    kpt_scores = scores_2d[row, col]
-
-    if max_keypoints > 0 and len(kpts) > max_keypoints:
-        kpt_scores, idx = torch.topk(kpt_scores, max_keypoints)
-        kpts = kpts[idx]
-
-    _, c, hf, wf = desc_norm.shape
-    stride = score_map.shape[2] // hf
-    norm_kpts = (kpts + 0.5) / (kpts.new_tensor([wf, hf]) * stride)
-    norm_kpts = norm_kpts * 2 - 1
-    descs = F.grid_sample(desc_norm, norm_kpts.view(1, 1, -1, 2),
-                          mode='bilinear', align_corners=False)
-    descs = F.normalize(descs.reshape(1, c, -1), p=2, dim=1).squeeze(0).T
-
-    return kpts.cpu().numpy(), kpt_scores.cpu().numpy(), descs.cpu().numpy()
+    return kpts.cpu().numpy(), scr.cpu().numpy(), descs.cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +151,10 @@ def _load_frame(path, height=480, width=640):
         img = Image.open(path).convert('RGB')
     img = img.resize((width, height), Image.LANCZOS)
     gray = np.array(img.convert('L'), dtype=np.float32) / 255.0
-    t = torch.from_numpy(gray).unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
-    return t, img
+    t_gray = torch.from_numpy(gray).unsqueeze(0).unsqueeze(0)       # [1,1,H,W]
+    rgb = np.array(img, dtype=np.float32) / 255.0                   # [H,W,3]
+    t_rgb = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)    # [1,3,H,W]
+    return t_gray, t_rgb, img
 
 
 def _draw_kpts(img_rgb: Image.Image, kpts: np.ndarray, color) -> np.ndarray:
@@ -197,7 +188,8 @@ def main():
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--nms-radius", type=int, default=4)
     parser.add_argument("--threshold", type=float, default=0.005)
-    parser.add_argument("--max-keypoints", type=int, default=1024)
+    parser.add_argument("--max-keypoints", type=int, default=512)
+    parser.add_argument("--remove-borders", type=int, default=4)
     parser.add_argument(
         "--output", default="validation_output.png",
         help="Path for side-by-side visualisation (default: validation_output.png)"
@@ -212,29 +204,43 @@ def main():
 
     raw_enc = _RawEncoder(sp).eval()
 
-    from export_onnx import SuperPointEncoder
-    new_enc = SuperPointEncoder(sp, nms_radius=args.nms_radius).eval()
+    from export_onnx import SuperPointEncoder, SuperPointEncoderRGB
+    new_enc = SuperPointEncoderRGB(
+        SuperPointEncoder(
+            sp,
+            nms_radius=args.nms_radius,
+            max_keypoints=args.max_keypoints,
+            remove_borders=args.remove_borders,
+            height=args.height,
+            width=args.width,
+        )
+    ).eval()
 
     # ---- Load image ----
-    image_t, orig_img = _load_frame(args.input, args.height, args.width)
-    print(f"Input: {args.input}  →  {args.width}×{args.height} grayscale")
+    image_t, image_rgb_t, orig_img = _load_frame(args.input, args.height, args.width)
+    print(f"Input: {args.input}  →  {args.width}×{args.height}")
 
     # ---- Run both pipelines ----
     with torch.no_grad():
         scores_logits, desc_map_raw = raw_enc(image_t)
-        score_map, desc_norm = new_enc(image_t)
+        new_keypoints, new_scores, new_descriptors = new_enc(image_rgb_t)
 
     # ---- Sanity-check model outputs ----
-    assert score_map.min() >= 0, "score_map has negative values"
-    assert score_map.max() <= 1 + 1e-4, f"score_map max {score_map.max():.5f} > 1"
-    norms = desc_norm.norm(dim=1)
-    assert norms.min() > 0.99, f"desc_norm not unit: min={norms.min():.4f}"
+    assert new_scores.min() >= 0, "scores have negative values"
+    assert new_scores.max() <= 1 + 1e-4, f"scores max {new_scores.max():.5f} > 1"
+    desc_norms = new_descriptors.norm(dim=-1)
+    # Zero-padded slots (score == 0) will have zero-norm descriptors; skip them.
+    valid_mask = new_scores[0] > 0
+    if valid_mask.any():
+        valid_norms = desc_norms[0][valid_mask]
+        assert valid_norms.min() > 0.99, f"descriptors not unit-norm: min={valid_norms.min():.4f}"
 
     kw = dict(nms_radius=args.nms_radius, threshold=args.threshold,
               max_keypoints=args.max_keypoints)
     old_kpts, old_scr, old_desc = _old_postprocess(scores_logits, desc_map_raw, **kw)
-    new_kw = dict(threshold=args.threshold, max_keypoints=args.max_keypoints)
-    new_kpts, new_scr, new_desc = _new_postprocess(score_map, desc_norm, **new_kw)
+    new_kpts, new_scr, new_desc = _new_postprocess(
+        new_keypoints, new_scores, new_descriptors, threshold=args.threshold
+    )
 
     # ---- Report ----
     print(f"\n{'':=<62}")

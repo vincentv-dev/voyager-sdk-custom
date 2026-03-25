@@ -1,20 +1,29 @@
-// SuperPoint post-processing GStreamer decoder for Axelera Metis M2
+// SuperPoint INT8 GStreamer decoder for Axelera Metis M2
 //
-// The ONNX model already handles:
-//   - Softmax + pixel-shuffle  → score_map  [1, 1, H, W]  (NMS-suppressed)
-//   - Max-pool NMS             → suppressed score map
-//   - L2-normalisation         → desc_norm  [1, 256, Hf, Wf]
+// Receives raw INT8 NHWC tensors directly from the AIPU (handle_all: false):
+//   desc_tensor   [1, Hf, Wf, 256]  int8  — raw descriptor features
+//   logit_tensor  [1, Hf, Wf, 128]  int8  — detector logits (65 real + 63 padding)
 //
-// This decoder only needs to run on the host CPU:
-//   1. Border removal + threshold → candidate keypoints
-//   2. Top-k selection            → final N keypoints
-//   3. Bilinear sampling of desc_norm at keypoint locations → [N, 256] descriptors
-//   4. Per-descriptor L2-normalise (bilinear blend of unit vectors isn't unit-norm)
+// Algorithm — all ordering decisions use INT8 arithmetic until after TopK:
+//   1. Channel-max over channels 0..63 per backbone cell
+//      → per-cell peak score (int8) + sub-pixel channel index (uint8)
+//   2. 3×3 spatial NMS at backbone resolution (INT8 comparisons)
+//      + border masking (ceil(remove_borders / 8) cells excluded)
+//   3. Sort surviving cells by INT8 score descending, take top max_keypoints
+//   4. For each selected cell:
+//        a. Dequantize 65 logit channels, compute softmax probability
+//        b. Discard if prob <= detection_threshold
+//        c. Bilinear-sample desc map at sub-pixel location, dequantize, L2-normalise
+//   5. Store [N,2] keypoints, [N] scores, [N,256] descriptors as AxMetaRawTensor
 //
-// Output stored as AxMetaRawTensor → deserialized by Python TensorMeta:
-//   tensors[0]  keypoints    [N, 2]    float32  (x, y) pixel coords
-//   tensors[1]  scores       [N]       float32  detector confidence
-//   tensors[2]  descriptors  [N, 256]  float32  L2-normalised
+// Parameters injected via YAML options string:
+//   meta_key            — AxMeta dictionary key (default: "superpoint")
+//   detection_threshold — Score threshold in probability space (default: 0.005)
+//   remove_borders      — Border pixels to suppress (default: 4)
+//   max_keypoints       — Maximum keypoints returned (default: 1024)
+//   scales              — Comma-separated dequant scales: desc,logit
+//   zero_points         — Comma-separated dequant zero points: desc,logit
+//                         Formula: float = scale * (int8 - zero_point)
 
 #include "AxDataInterface.h"
 #include "AxLog.hpp"
@@ -22,51 +31,42 @@
 #include "AxOpUtils.hpp"
 
 #include <algorithm>
+#include <array>
+#include <climits>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
-// ---- Constants matching the SuperPoint architecture ----
-static constexpr int DESC_DIM = 256;
+static constexpr int DESC_DIM      = 256;
+static constexpr int LOGIT_CH_REAL = 65;   // 64 non-dustbin + 1 dustbin
+static constexpr int LOGIT_CH_PAD  = 128;  // NHWC stride (63 zero-padded channels)
+static constexpr int STRIDE        = 8;    // backbone stride (pixel-shuffle cell size)
 
 // ---- Properties parsed from YAML options string ----
 struct Props {
-  std::string meta_name        = "superpoint";
-  float       det_threshold    = 0.005f;
-  int         remove_borders   = 4;
-  int         max_keypoints    = 1024;   // ≤0 → unlimited
+  std::string meta_name      = "superpoint";
+  float       det_threshold  = 0.005f;
+  int         remove_borders = 4;
+  int         max_keypoints  = 512;
+  float       scale_desc     = 1.0f;  // desc dequant scale
+  float       zp_desc        = 0.0f;  // desc dequant zero point
+  float       scale_logit    = 1.0f;  // logit dequant scale
+  float       zp_logit       = 0.0f;  // logit dequant zero point
 };
 
-// ============================================================
-//  Helpers
-// ============================================================
-
-// L2-normalise a float vector in-place (safe for zero-norm).
-static void
-l2_normalize(float* v, int n)
+static std::vector<float>
+parse_floats(const std::string& s)
 {
-  float sq = 0.f;
-  for (int i = 0; i < n; ++i) sq += v[i] * v[i];
-  float inv = 1.f / std::sqrt(sq + 1e-10f);
-  for (int i = 0; i < n; ++i) v[i] *= inv;
-}
-
-// Bilinear sample from a single 2-D channel [Hf × Wf].
-// Coordinates (px, py) are in descriptor-map pixel space [0, Wf) × [0, Hf).
-static float
-bilinear(const float* ch, int Hf, int Wf, float px, float py)
-{
-  int x0 = std::max(0, std::min(Wf - 1, (int)std::floor(px)));
-  int y0 = std::max(0, std::min(Hf - 1, (int)std::floor(py)));
-  int x1 = std::min(Wf - 1, x0 + 1);
-  int y1 = std::min(Hf - 1, y0 + 1);
-  float wx = px - std::floor(px), wy = py - std::floor(py);
-  return (1 - wx) * (1 - wy) * ch[y0 * Wf + x0]
-       +      wx  * (1 - wy) * ch[y0 * Wf + x1]
-       + (1 - wx) *      wy  * ch[y1 * Wf + x0]
-       +      wx  *      wy  * ch[y1 * Wf + x1];
+  std::vector<float> v;
+  std::istringstream ss(s);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    try { v.push_back(std::stof(tok)); } catch (...) {}
+  }
+  return v;
 }
 
 // ============================================================
@@ -79,24 +79,29 @@ init_and_set_static_properties(
     const std::unordered_map<std::string, std::string>& input, Ax::Logger& log)
 {
   auto p = std::make_shared<Props>();
-  auto get = [&](const char* k, auto& dst) {
-    if (auto it = input.find(k); it != input.end()) {
-      if constexpr (std::is_same_v<std::decay_t<decltype(dst)>, std::string>)
-        dst = it->second;
-      else if constexpr (std::is_same_v<std::decay_t<decltype(dst)>, int>)
-        dst = std::stoi(it->second);
-      else
-        dst = std::stof(it->second);
-    }
-  };
-  get("meta_key",           p->meta_name);
-  get("detection_threshold",p->det_threshold);
-  get("remove_borders",     p->remove_borders);
-  get("max_keypoints",      p->max_keypoints);
 
-  log(AX_INFO) << "SuperPoint decoder init: threshold=" << p->det_threshold
-               << " borders=" << p->remove_borders
-               << " max_kpts=" << p->max_keypoints;
+  if (auto it = input.find("meta_key");            it != input.end()) p->meta_name      = it->second;
+  if (auto it = input.find("detection_threshold"); it != input.end()) p->det_threshold  = std::stof(it->second);
+  if (auto it = input.find("remove_borders");      it != input.end()) p->remove_borders = std::stoi(it->second);
+  if (auto it = input.find("max_keypoints");       it != input.end()) p->max_keypoints  = std::stoi(it->second);
+
+  if (auto it = input.find("scales"); it != input.end()) {
+    auto v = parse_floats(it->second);
+    if (v.size() >= 1) p->scale_desc  = v[0];
+    if (v.size() >= 2) p->scale_logit = v[1];
+  }
+  if (auto it = input.find("zero_points"); it != input.end()) {
+    auto v = parse_floats(it->second);
+    if (v.size() >= 1) p->zp_desc  = v[0];
+    if (v.size() >= 2) p->zp_logit = v[1];
+  }
+
+  log(AX_INFO) << "SuperPoint INT8 decoder init:"
+               << " threshold=" << p->det_threshold
+               << " max_kpts="  << p->max_keypoints
+               << " borders="   << p->remove_borders
+               << " scale_desc="   << p->scale_desc  << " zp_desc="  << p->zp_desc
+               << " scale_logit="  << p->scale_logit << " zp_logit=" << p->zp_logit;
   return p;
 }
 
@@ -104,7 +109,8 @@ const std::unordered_set<std::string>&
 allowed_properties()
 {
   static const std::unordered_set<std::string> s{
-    "meta_key", "detection_threshold", "remove_borders", "max_keypoints"
+    "meta_key", "detection_threshold", "remove_borders",
+    "max_keypoints", "scales", "zero_points"
   };
   return s;
 }
@@ -123,85 +129,184 @@ decode_to_meta(
     const AxDataInterface&     /*video*/,
     Ax::Logger&                log)
 try {
-  // --- Identify tensors by channel count (AIPU may reorder outputs) ---
-  // score_map:  [1, 1,   H,  W ]  — NMS-suppressed softmax scores
-  // desc_norm:  [1, 256, Hf, Wf]  — L2-normalised descriptor map
-  const float* score_ptr = nullptr;
-  const float* desc_ptr  = nullptr;
-  int H = 0, W = 0, Hf = 0, Wf = 0;
+  // ---- Identify tensors by last dimension ----
+  // desc:  NHWC [1, Hf, Wf, 256]  int8
+  // logit: NHWC [1, Hf, Wf, 128]  int8  (65 real + 63 padding)
+  const int8_t* desc_ptr  = nullptr;
+  const int8_t* logit_ptr = nullptr;
+  int Hf = 0, Wf = 0;
 
   for (const auto& t : in_tensors) {
-    if (t.sizes.size() != 4 || t.bytes != 4) continue;  // expect float32 NCHW
-    if (!t.data) continue;                               // unmapped DMA buffer
-    int C = t.sizes[1];
-    if (C == 1) {
-      score_ptr = static_cast<const float*>(t.data);
-      H = t.sizes[2];
-      W = t.sizes[3];
-    } else if (C == DESC_DIM) {
-      desc_ptr = static_cast<const float*>(t.data);
-      Hf = t.sizes[2];
-      Wf = t.sizes[3];
+    if (!t.data || t.bytes != 1) continue;
+    const auto& sz = t.sizes;
+    if (sz.size() == 4 && sz[3] == DESC_DIM && !desc_ptr) {
+      desc_ptr = static_cast<const int8_t*>(t.data);
+      Hf = sz[1]; Wf = sz[2];
+    } else if (sz.size() == 4 && sz[3] == LOGIT_CH_PAD && !logit_ptr) {
+      logit_ptr = static_cast<const int8_t*>(t.data);
+      if (Hf == 0) { Hf = sz[1]; Wf = sz[2]; }
     }
   }
 
-  if (!score_ptr || !desc_ptr || H == 0 || Hf == 0) {
-    log(AX_ERROR) << "SuperPoint: could not identify output tensors";
+  if (!desc_ptr || !logit_ptr || Hf == 0 || Wf == 0) {
+    log(AX_ERROR) << "SuperPoint: could not identify INT8 NHWC output tensors";
     return;
   }
 
-  // Stride (H / Hf = 8 for SuperPoint VGG backbone)
-  const float stride = static_cast<float>(H) / static_cast<float>(Hf);
+  // ---- Step 1: Channel-max over 64 non-dustbin channels per backbone cell ----
+  // Pixel-shuffle convention: channel c at backbone cell (h,w) maps to
+  //   full-resolution pixel (w*8 + c%8, h*8 + c//8)
+  const int Ncells = Hf * Wf;
+  std::vector<int8_t>  cell_best_val(Ncells, INT8_MIN);
+  std::vector<uint8_t> cell_best_ch (Ncells, 0);
 
-  // ---- 1. Border removal + threshold → candidates ----
-  struct Candidate { float score; int x, y; };
-  std::vector<Candidate> cands;
-  cands.reserve(4096);
-
-  const int pad = prop->remove_borders;
-  for (int h = 0; h < H; ++h) {
-    if (h < pad || h >= H - pad) continue;
-    for (int w = 0; w < W; ++w) {
-      if (w < pad || w >= W - pad) continue;
-      float s = score_ptr[h * W + w];
-      if (s > prop->det_threshold)
-        cands.push_back({ s, w, h });
+  for (int h = 0; h < Hf; ++h) {
+    for (int w = 0; w < Wf; ++w) {
+      const int8_t* row = logit_ptr + (h * Wf + w) * LOGIT_CH_PAD;
+      int8_t  best_val = INT8_MIN;
+      uint8_t best_ch  = 0;
+      for (int c = 0; c < 64; ++c) {   // 0..63: non-dustbin channels
+        if (row[c] > best_val) {
+          best_val = row[c];
+          best_ch  = static_cast<uint8_t>(c);
+        }
+      }
+      const int idx = h * Wf + w;
+      cell_best_val[idx] = best_val;
+      cell_best_ch [idx] = best_ch;
     }
   }
 
-  // ---- 2. Top-k selection ----
-  int N = static_cast<int>(cands.size());
-  if (prop->max_keypoints > 0 && N > prop->max_keypoints) {
-    std::partial_sort(cands.begin(), cands.begin() + prop->max_keypoints, cands.end(),
-        [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
-    cands.resize(prop->max_keypoints);
-    N = prop->max_keypoints;
-  }
-  log(AX_DEBUG) << "SuperPoint: " << N << " keypoints";
+  // ---- Step 2: 3×3 spatial NMS + border masking (all INT8 comparisons) ----
+  const int border_cells = (prop->remove_borders + STRIDE - 1) / STRIDE;
+  std::vector<bool> nms_mask(Ncells, false);
 
-  // ---- 3. Sample descriptors ----
-  // Descriptor-map coordinate for keypoint (x, y):
-  //   desc_x = (x + 0.5) / stride - 0.5   (follows SuperPoint grid_sample convention)
-  std::vector<float> kpts(N * 2);
-  std::vector<float> scores_out(N);
-  std::vector<float> descs(N * DESC_DIM, 0.f);
-
-  for (int i = 0; i < N; ++i) {
-    kpts[i * 2 + 0] = static_cast<float>(cands[i].x);
-    kpts[i * 2 + 1] = static_cast<float>(cands[i].y);
-    scores_out[i]   = cands[i].score;
-
-    float dx = (cands[i].x + 0.5f) / stride - 0.5f;
-    float dy = (cands[i].y + 0.5f) / stride - 0.5f;
-
-    for (int c = 0; c < DESC_DIM; ++c)
-      descs[i * DESC_DIM + c] = bilinear(desc_ptr + c * Hf * Wf, Hf, Wf, dx, dy);
-
-    // 4. Per-descriptor L2-normalise (bilinear blend of unit vectors isn't unit-norm)
-    l2_normalize(&descs[i * DESC_DIM], DESC_DIM);
+  for (int h = border_cells; h < Hf - border_cells; ++h) {
+    for (int w = border_cells; w < Wf - border_cells; ++w) {
+      const int8_t v = cell_best_val[h * Wf + w];
+      bool is_local_max = true;
+      for (int dh = -1; dh <= 1 && is_local_max; ++dh) {
+        for (int dw = -1; dw <= 1 && is_local_max; ++dw) {
+          if (dh == 0 && dw == 0) continue;
+          const int nh = h + dh, nw = w + dw;
+          if (nh < 0 || nh >= Hf || nw < 0 || nw >= Wf) continue;
+          if (cell_best_val[nh * Wf + nw] > v) is_local_max = false;
+        }
+      }
+      nms_mask[h * Wf + w] = is_local_max;
+    }
   }
 
-  // ---- 5. Store as AxMetaRawTensor (→ Python TensorMeta) ----
+  // ---- Step 3: Collect surviving cells, sort by INT8 score, take TopK ----
+  struct Candidate {
+    int8_t  score_int8;
+    uint8_t ch;
+    int16_t h, w;
+  };
+  std::vector<Candidate> candidates;
+  candidates.reserve(512);
+
+  for (int h = 0; h < Hf; ++h)
+    for (int w = 0; w < Wf; ++w)
+      if (nms_mask[h * Wf + w])
+        candidates.push_back({
+          cell_best_val[h * Wf + w],
+          cell_best_ch [h * Wf + w],
+          static_cast<int16_t>(h),
+          static_cast<int16_t>(w)
+        });
+
+  std::sort(candidates.begin(), candidates.end(),
+      [](const Candidate& a, const Candidate& b) { return a.score_int8 > b.score_int8; });
+
+  if (static_cast<int>(candidates.size()) > prop->max_keypoints)
+    candidates.resize(prop->max_keypoints);
+
+  // ---- Steps 4–7: Softmax score, threshold, bilinear descriptor sampling ----
+  const int K = static_cast<int>(candidates.size());
+  std::vector<float> out_kpts;
+  std::vector<float> out_scores;
+  std::vector<float> out_descs;
+  out_kpts.reserve(K * 2);
+  out_scores.reserve(K);
+  out_descs.reserve(K * DESC_DIM);
+
+  std::array<float, LOGIT_CH_REAL> logits_f;
+  std::array<float, DESC_DIM>      desc_f;
+
+  for (const auto& cand : candidates) {
+    const int h = cand.h, w = cand.w;
+    const int8_t* logit_row = logit_ptr + (h * Wf + w) * LOGIT_CH_PAD;
+
+    // -- Softmax score for the winning sub-pixel channel --
+    // Dequantize all 65 channels (0..63 non-dustbin + channel 64 dustbin)
+    for (int ch = 0; ch < LOGIT_CH_REAL; ++ch)
+      logits_f[ch] = prop->scale_logit * (static_cast<float>(logit_row[ch]) - prop->zp_logit);
+
+    // Numerically-stable softmax
+    float max_l = logits_f[0];
+    for (int ch = 1; ch < LOGIT_CH_REAL; ++ch)
+      if (logits_f[ch] > max_l) max_l = logits_f[ch];
+
+    float sum_exp = 0.0f;
+    for (int ch = 0; ch < LOGIT_CH_REAL; ++ch) {
+      logits_f[ch] = std::exp(logits_f[ch] - max_l);
+      sum_exp += logits_f[ch];
+    }
+    const float prob = logits_f[cand.ch] / sum_exp;
+    if (prob <= prop->det_threshold) continue;
+
+    // -- Bilinear descriptor sampling at sub-pixel location --
+    // Keypoint pixel coords (full resolution):
+    //   px = w*8 + ch%8,  py = h*8 + ch//8
+    // Sampling position in desc map [Hf, Wf]:
+    //   fx = px/8 = w + (ch%8)/8  →  floor=w, frac_x = (ch%8)/8
+    //   fy = py/8 = h + (ch//8)/8 →  floor=h, frac_y = (ch//8)/8
+    const float px = static_cast<float>(w * STRIDE + (cand.ch % STRIDE));
+    const float py = static_cast<float>(h * STRIDE + (cand.ch / STRIDE));
+
+    const float dx = static_cast<float>(cand.ch % STRIDE) / static_cast<float>(STRIDE);
+    const float dy = static_cast<float>(cand.ch / STRIDE) / static_cast<float>(STRIDE);
+    const int w1 = std::min(w + 1, Wf - 1);
+    const int h1 = std::min(h + 1, Hf - 1);
+
+    const float wa = (1.f - dy) * (1.f - dx);
+    const float wb = (1.f - dy) * dx;
+    const float wc = dy         * (1.f - dx);
+    const float wd = dy         * dx;
+
+    const int8_t* d00 = desc_ptr + (h  * Wf + w ) * DESC_DIM;
+    const int8_t* d01 = desc_ptr + (h  * Wf + w1) * DESC_DIM;
+    const int8_t* d10 = desc_ptr + (h1 * Wf + w ) * DESC_DIM;
+    const int8_t* d11 = desc_ptr + (h1 * Wf + w1) * DESC_DIM;
+
+    // Dequantize and bilinear-blend each descriptor channel, then L2-normalise
+    // float = scale * (blended_int8 - zp)   [wa+wb+wc+wd == 1 ensures zp cancels]
+    float norm_sq = 0.0f;
+    for (int d = 0; d < DESC_DIM; ++d) {
+      const float blended =
+          wa * static_cast<float>(d00[d]) +
+          wb * static_cast<float>(d01[d]) +
+          wc * static_cast<float>(d10[d]) +
+          wd * static_cast<float>(d11[d]);
+      const float val = prop->scale_desc * (blended - prop->zp_desc);
+      desc_f[d] = val;
+      norm_sq  += val * val;
+    }
+    const float inv_norm = (norm_sq > 1e-12f) ? (1.0f / std::sqrt(norm_sq)) : 0.0f;
+    for (int d = 0; d < DESC_DIM; ++d)
+      desc_f[d] *= inv_norm;
+
+    out_kpts.push_back(px);
+    out_kpts.push_back(py);
+    out_scores.push_back(prob);
+    out_descs.insert(out_descs.end(), desc_f.begin(), desc_f.end());
+  }
+
+  const int N = static_cast<int>(out_scores.size());
+  log(AX_DEBUG) << "SuperPoint: " << N << " keypoints (K=" << K << " candidates=" << candidates.size() << ")";
+
+  // ---- Store as AxMetaRawTensor (→ Python TensorMeta / SuperPointMeta) ----
   auto* meta = ax_utils::insert_meta<AxMetaRawTensor>(
       map, prop->meta_name, std::string{}, subframe_index, subframe_number);
   if (!meta) {
@@ -209,20 +314,17 @@ try {
     return;
   }
 
-  // Guard: std::vector::data() may return nullptr when empty (N==0).
-  // FORTIFY_SOURCE aborts on memcpy(dst, nullptr, 0), so provide a
-  // valid fallback pointer when there are no keypoints.
   static constexpr float kEmpty = 0.f;
-  const float* kpts_data  = N > 0 ? kpts.data()      : &kEmpty;
-  const float* scr_data   = N > 0 ? scores_out.data(): &kEmpty;
-  const float* desc_data  = N > 0 ? descs.data()     : &kEmpty;
+  const float* kpts_data = N > 0 ? out_kpts.data()   : &kEmpty;
+  const float* scr_data  = N > 0 ? out_scores.data() : &kEmpty;
+  const float* desc_data = N > 0 ? out_descs.data()  : &kEmpty;
 
-  // tensors[0]: keypoints  [N, 2]
-  meta->add_tensor(kpts_data,  N * 2,        sizeof(float), { N, 2 });
-  // tensors[1]: scores     [N]
-  meta->add_tensor(scr_data,   N,             sizeof(float), { N });
-  // tensors[2]: descriptors [N, 256]
-  meta->add_tensor(desc_data,  N * DESC_DIM, sizeof(float), { N, DESC_DIM });
+  // tensors[0]: keypoints    [N, 2]
+  // tensors[1]: scores       [N]
+  // tensors[2]: descriptors  [N, 256]
+  meta->add_tensor(kpts_data, N * 2,        sizeof(float), { N, 2 });
+  meta->add_tensor(scr_data,  N,            sizeof(float), { N });
+  meta->add_tensor(desc_data, N * DESC_DIM, sizeof(float), { N, DESC_DIM });
 }
 catch (const std::exception& e) {
   log(AX_ERROR) << "SuperPoint decoder caught exception: " << e.what();

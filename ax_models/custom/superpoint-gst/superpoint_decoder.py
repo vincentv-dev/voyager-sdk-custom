@@ -1,17 +1,21 @@
 # SuperPoint CPU decoder for Axelera Voyager SDK
 #
-# The ONNX model already handles:
-#   - Softmax + pixel-shuffle   → full-resolution score map [1,1,H,W]
-#   - Max-pool NMS              → suppressed score map
-#   - L2-normalisation          → unit-norm descriptor map [1,256,H//8,W//8]
+# GStreamer path (handle_all: false):
+#   Receives raw INT8 NHWC tensors from the AIPU; all post-processing
+#   (channel-max, NMS, TopK, softmax scoring, bilinear desc sampling,
+#   L2-normalise) is performed in the C++ plugin libdecode_superpoint.so.
+#   This Python class only injects runtime parameters into the GStreamer
+#   options string (including per-tensor dequantize params from manifest.json).
 #
-# This decoder only needs to:
-#   1. Border removal + threshold → candidate keypoints
-#   2. Top-k selection           → final keypoints
-#   3. Bilinear descriptor sampling at keypoint locations
+# Python / ORT path (exec_torch):
+#   ORT runs the full ONNX graph in float32, outputting pre-processed
+#   keypoints [1,K,2], scores [1,K], descriptors [1,K,256].
+#   This method applies detection_threshold and unpacks the results.
 #
 # Results are stored as SuperPointMeta (torch path) or TensorMeta (GStreamer path).
-# In GStreamer mode use --pipe=torch for visual validation.
+#
+# NOTE: max_keypoints and remove_borders are runtime parameters for the C++
+#       decoder (passed via options string) as well as for exec_torch.
 
 from __future__ import annotations
 
@@ -21,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from axelera import types
 from axelera.app import display, gst_builder, logging_utils
@@ -34,7 +37,6 @@ if TYPE_CHECKING:
 
 LOG = logging_utils.getLogger(__name__)
 
-_SUPERPOINT_STRIDE = 8   # VGG backbone has 3 max-pools → stride 8
 _DESC_DIM = 256
 
 _GREEN = (0, 220, 0, 255)
@@ -65,58 +67,36 @@ class SuperPointMeta(AxTaskMeta):
 
 
 # ---------------------------------------------------------------------------
-# Pure-torch helpers
-# ---------------------------------------------------------------------------
-
-def _sample_descriptors(
-    keypoints: torch.Tensor,          # [N, 2]  (x, y) pixel coordinates
-    desc_map: torch.Tensor,           # [1, C, Hf, Wf]  L2-normalised dense map
-    stride: int = _SUPERPOINT_STRIDE,
-) -> torch.Tensor:
-    """Bilinear interpolation of descriptors at keypoint locations.
-
-    Follows the original SuperPoint sampling convention: keypoint (x, y) is
-    in full-image pixel space; desc_map is at 1/stride resolution.
-
-    Returns:
-        [N, C] L2-normalised descriptors
-    """
-    _, c, h, w = desc_map.shape
-    # Normalise coordinates to [-1, 1] for grid_sample
-    norm_kpts = (keypoints + 0.5) / (keypoints.new_tensor([w, h]) * stride)
-    norm_kpts = norm_kpts * 2 - 1                    # [-1, 1]
-
-    descs = F.grid_sample(
-        desc_map,
-        norm_kpts.view(1, 1, -1, 2),
-        mode="bilinear",
-        align_corners=False,
-    )                                                # [1, C, 1, N]
-    descs = descs.reshape(1, c, -1)                 # [1, C, N]
-    descs = F.normalize(descs, p=2, dim=1)          # unit-norm
-    return descs.squeeze(0).T                       # [N, C]
-
-
-# ---------------------------------------------------------------------------
 # AxOperator decoder
 # ---------------------------------------------------------------------------
 
 class SuperPointDecoder(AxOperator):
     """Post-process SuperPoint AIPU outputs on the host CPU.
 
-    The ONNX model already performs softmax, pixel-shuffle, NMS, and
-    L2-normalisation.  This operator only does keypoint extraction and
-    descriptor sampling.
+    GStreamer path (handle_all: false):
+        Receives raw INT8 NHWC tensors directly from the AIPU:
+            desc_map   [1, Hf, Wf, 256]  int8  — raw descriptor features
+            logits     [1, Hf, Wf, 128]  int8  — detector logits (65 real + 63 padding)
+        Performs entirely in fixed-point:
+            1. Channel-max over 64 spatial channels  →  per-cell peak
+            2. 3×3 spatial NMS at backbone resolution (INT8 comparisons)
+            3. TopK selection
+            4. Softmax score computation for K selected cells only
+            5. Bilinear descriptor sampling + dequantize + L2-normalise
+
+    Python exec_torch path (ORT runs full ONNX graph, outputs float32):
+        Receives keypoints [1,K,2], scores [1,K], descriptors [1,K,256].
+        Applies detection_threshold and unpacks.
 
     Parameters (all configurable from YAML):
-        detection_threshold Score threshold (default: 0.005)
-        remove_borders      Pixels to suppress at image border (default: 4)
-        max_keypoints       Cap on returned keypoints; -1 = unlimited (default: 1024)
+        detection_threshold  Score threshold in probability space (default: 0.005)
+        remove_borders       Border pixels to suppress (default: 4)
+        max_keypoints        Maximum keypoints returned (default: 1024)
     """
 
     detection_threshold: float = 0.005
     remove_borders: int = 4
-    max_keypoints: int = 1024
+    max_keypoints: int = 512
 
     def _post_init(self):
         pass
@@ -126,6 +106,26 @@ class SuperPointDecoder(AxOperator):
     # ------------------------------------------------------------------
 
     def build_gst(self, gst: gst_builder.Builder, stream_idx: str):
+        # Read per-tensor dequantize params from the compiled model manifest so the
+        # C++ decoder can selectively dequantize only the keypoints it selects.
+        scales      = "1.0,1.0"
+        zero_points = "0.0,0.0"
+        if self._compiled_model_dir is not None:
+            import json
+            from pathlib import Path
+            manifest_path = Path(self._compiled_model_dir) / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text())
+                    deq = manifest.get("dequantize_params", [])
+                    if len(deq) >= 2:
+                        # deq[0] = [scale, zp] for desc [1,Hf,Wf,256]
+                        # deq[1] = [scale, zp] for logits [1,Hf,Wf,128]
+                        scales      = f"{deq[0][0]},{deq[1][0]}"
+                        zero_points = f"{deq[0][1]},{deq[1][1]}"
+                except Exception as exc:
+                    LOG.warning(f"SuperPoint: could not read manifest dequant params: {exc}")
+
         gst.decode_muxer(
             name=f'decoder_task{self._taskn}{stream_idx}',
             lib='libdecode_superpoint.so',
@@ -135,6 +135,8 @@ class SuperPointDecoder(AxOperator):
                 f'detection_threshold:{self.detection_threshold};'
                 f'remove_borders:{self.remove_borders};'
                 f'max_keypoints:{self.max_keypoints};'
+                f'scales:{scales};'
+                f'zero_points:{zero_points};'
             ),
         )
 
@@ -148,76 +150,67 @@ class SuperPointDecoder(AxOperator):
         predict: Union[tuple, list],
         axmeta,
     ):
-        """Process AIPU outputs into keypoints + descriptors.
+        """Unpack pre-computed ONNX outputs into keypoints + descriptors.
 
         Args:
             image:   Input PIL Image (passed through unchanged)
-            predict: Tuple (score_map [1,1,H,W], desc_norm [1,256,Hf,Wf])
-                     Softmax, pixel-shuffle, NMS, and L2-norm are already
-                     applied by the ONNX model (handle_all=true dequantizes).
+            predict: Tuple of three tensors output by the ONNX model:
+                       keypoints    [1, K, 2]    (x, y) pixel coords, score-sorted
+                       scores       [1, K]       detector confidence
+                       descriptors  [1, K, 256]  L2-normalised
+                     handle_all=true ensures they arrive as float32.
             axmeta:  Pipeline metadata container
 
         Returns:
             (image, predict, axmeta) — axmeta enriched with a TensorMeta entry.
         """
-        if not isinstance(predict, (list, tuple)) or len(predict) < 2:
+        if not isinstance(predict, (list, tuple)) or len(predict) < 3:
             LOG.warning(
-                "SuperPointDecoder: expected a 2-element tuple (score_map, desc_norm), "
-                f"got {type(predict)}. Skipping."
+                "SuperPointDecoder: expected 3 tensors (keypoints, scores, descriptors), "
+                f"got {len(predict) if isinstance(predict, (list, tuple)) else type(predict)}. "
+                "Skipping."
             )
             return image, predict, axmeta
 
-        # Identify outputs by channel count — the AIPU may return them in any order.
-        score_map = desc_norm = None
+        # Identify outputs by shape — AIPU may return them in any order.
+        keypoints = scores = descriptors = None
         for t in predict:
-            if t.ndim == 4 and t.shape[1] == 1:
-                score_map = t    # [1, 1, H, W]  NMS-suppressed
-            elif t.ndim == 4 and t.shape[1] == 256:
-                desc_norm = t    # [1, 256, Hf, Wf]  L2-normalised
+            if t.ndim == 3 and t.shape[-1] == 2:
+                keypoints = t        # [1, K, 2]
+            elif t.ndim == 3 and t.shape[-1] == _DESC_DIM:
+                descriptors = t      # [1, K, 256]
+            elif t.ndim == 2:
+                scores = t           # [1, K]
 
-        if score_map is None or desc_norm is None:
+        if keypoints is None or scores is None or descriptors is None:
             shapes = [tuple(t.shape) for t in predict]
             LOG.warning(f"SuperPointDecoder: could not identify outputs by shape: {shapes}")
             return image, predict, axmeta
 
-        scores_2d = score_map.squeeze(0).squeeze(0)   # [H, W]
+        # Squeeze batch dim
+        kpts  = keypoints[0]     # [K, 2]
+        scr   = scores[0]        # [K]
+        descs = descriptors[0]   # [K, 256]
 
-        # ---- 1. Border removal ----
-        pad = self.remove_borders
-        if pad > 0:
-            scores_2d = scores_2d.clone()
-            scores_2d[:pad, :] = 0
-            scores_2d[:, :pad] = 0
-            scores_2d[-pad:, :] = 0
-            scores_2d[:, -pad:] = 0
-
-        # ---- 2. Threshold + extract keypoints ----
-        row_idx, col_idx = torch.where(scores_2d > self.detection_threshold)
-        # Stack as (x, y) = (col, row)
-        kpts = torch.stack([col_idx, row_idx], dim=-1).float()   # [N, 2]
-        kpt_scores = scores_2d[row_idx, col_idx]                 # [N]
-
-        # ---- 3. Top-k ----
-        if self.max_keypoints > 0 and len(kpts) > self.max_keypoints:
-            kpt_scores, top_idx = torch.topk(kpt_scores, self.max_keypoints)
-            kpts = kpts[top_idx]
+        # ---- Threshold filter ----
+        # TopK always returns K slots; slots where no real keypoint exists have
+        # score ≈ 0 (NMS zero-suppressed areas).  Drop them here.
+        if self.detection_threshold > 0:
+            mask  = scr > self.detection_threshold
+            kpts  = kpts[mask]
+            scr   = scr[mask]
+            descs = descs[mask]
 
         n_kpts = len(kpts)
         LOG.debug(f"SuperPoint: {n_kpts} keypoints detected")
 
-        # ---- 4. Sample descriptors ----
-        if n_kpts > 0:
-            descs = _sample_descriptors(kpts, desc_norm, stride=_SUPERPOINT_STRIDE)
-            descs_np = descs.cpu().detach().numpy().astype(np.float32)   # [N, 256]
-        else:
-            descs_np = np.zeros((0, _DESC_DIM), dtype=np.float32)
+        kpts_np  = kpts.cpu().detach().numpy().astype(np.float32)   # [N, 2]
+        scr_np   = scr.cpu().detach().numpy().astype(np.float32)    # [N]
+        descs_np = descs.cpu().detach().numpy().astype(np.float32)  # [N, 256]
 
-        kpts_np = kpts.cpu().detach().numpy().astype(np.float32)        # [N, 2]
-        scores_np = kpt_scores.cpu().detach().numpy().astype(np.float32) # [N]
-
-        # ---- 5. Store results ----
+        # ---- Store results ----
         model_meta = SuperPointMeta(
-            keypoints=kpts_np, scores=scores_np, descriptors=descs_np
+            keypoints=kpts_np, scores=scr_np, descriptors=descs_np
         )
         axmeta.add_instance(self.task_name, model_meta)
 
