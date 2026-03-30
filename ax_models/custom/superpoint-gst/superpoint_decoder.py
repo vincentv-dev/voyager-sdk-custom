@@ -1,14 +1,17 @@
 # SuperPoint CPU decoder for Axelera Voyager SDK
 #
-# The ONNX model already handles:
-#   - Softmax + pixel-shuffle   → full-resolution score map [1,1,H,W]
-#   - Max-pool NMS              → suppressed score map
-#   - L2-normalisation          → unit-norm descriptor map [1,256,H//8,W//8]
+# The ONNX model outputs raw tensors only (Conv/ReLU/MaxPool backbone + heads).
+# Post-processing ops (Softmax, PixelShuffle/Reshape/Transpose, Equal+Cast for
+# NMS, and ReduceL2/Div for L2-norm) are NOT in the ONNX because they are
+# unsupported by the Metis M2 AIPU compiler and would fall to the IMX8MP CPU
+# build path.  This decoder handles them explicitly:
 #
-# This decoder only needs to:
-#   1. Border removal + threshold → candidate keypoints
-#   2. Top-k selection           → final keypoints
-#   3. Bilinear descriptor sampling at keypoint locations
+#   1. Softmax over 65 logit channels + dustbin removal + pixel-shuffle → [1,1,H,W]
+#   2. Single-pass max-pool NMS                         → suppressed score map
+#   3. L2-normalisation of the descriptor map           → unit-norm [1,256,H//8,W//8]
+#   4. Border removal + threshold                       → candidate keypoints
+#   5. Top-k selection                                  → final keypoints
+#   6. Bilinear descriptor sampling at keypoint locations
 #
 # Results are stored as SuperPointMeta (torch path) or TensorMeta (GStreamer path).
 # In GStreamer mode use --pipe=torch for visual validation.
@@ -104,19 +107,21 @@ def _sample_descriptors(
 class SuperPointDecoder(AxOperator):
     """Post-process SuperPoint AIPU outputs on the host CPU.
 
-    The ONNX model already performs softmax, pixel-shuffle, NMS, and
-    L2-normalisation.  This operator only does keypoint extraction and
-    descriptor sampling.
+    The ONNX model outputs raw logits and raw descriptor map.  This operator
+    performs all post-processing: softmax, pixel-shuffle, NMS, L2-norm, then
+    keypoint extraction and descriptor sampling.
 
     Parameters (all configurable from YAML):
         detection_threshold Score threshold (default: 0.005)
         remove_borders      Pixels to suppress at image border (default: 4)
         max_keypoints       Cap on returned keypoints; -1 = unlimited (default: 1024)
+        nms_radius          Max-pool NMS suppression radius in pixels (default: 4)
     """
 
     detection_threshold: float = 0.005
     remove_borders: int = 4
     max_keypoints: int = 1024
+    nms_radius: int = 4
 
     def _post_init(self):
         pass
@@ -135,6 +140,7 @@ class SuperPointDecoder(AxOperator):
                 f'detection_threshold:{self.detection_threshold};'
                 f'remove_borders:{self.remove_borders};'
                 f'max_keypoints:{self.max_keypoints};'
+                f'nms_radius:{self.nms_radius};'
             ),
         )
 
@@ -152,9 +158,9 @@ class SuperPointDecoder(AxOperator):
 
         Args:
             image:   Input PIL Image (passed through unchanged)
-            predict: Tuple (score_map [1,1,H,W], desc_norm [1,256,Hf,Wf])
-                     Softmax, pixel-shuffle, NMS, and L2-norm are already
-                     applied by the ONNX model (handle_all=true dequantizes).
+            predict: Tuple (scores_logits [1,65,Hf,Wf], desc_map [1,256,Hf,Wf])
+                     Raw outputs from the ONNX model; handle_all=true dequantizes
+                     them to float32 before this function is called.
             axmeta:  Pipeline metadata container
 
         Returns:
@@ -162,24 +168,41 @@ class SuperPointDecoder(AxOperator):
         """
         if not isinstance(predict, (list, tuple)) or len(predict) < 2:
             LOG.warning(
-                "SuperPointDecoder: expected a 2-element tuple (score_map, desc_norm), "
+                "SuperPointDecoder: expected a 2-element tuple "
+                "(scores_logits, desc_map), "
                 f"got {type(predict)}. Skipping."
             )
             return image, predict, axmeta
 
         # Identify outputs by channel count — the AIPU may return them in any order.
-        score_map = desc_norm = None
+        scores_logits = desc_map_raw = None
         for t in predict:
-            if t.ndim == 4 and t.shape[1] == 1:
-                score_map = t    # [1, 1, H, W]  NMS-suppressed
+            if t.ndim == 4 and t.shape[1] == 65:
+                scores_logits = t    # [1, 65, Hf, Wf]  raw logits
             elif t.ndim == 4 and t.shape[1] == 256:
-                desc_norm = t    # [1, 256, Hf, Wf]  L2-normalised
+                desc_map_raw = t     # [1, 256, Hf, Wf]  raw descriptors
 
-        if score_map is None or desc_norm is None:
+        if scores_logits is None or desc_map_raw is None:
             shapes = [tuple(t.shape) for t in predict]
             LOG.warning(f"SuperPointDecoder: could not identify outputs by shape: {shapes}")
             return image, predict, axmeta
 
+        # ---- Post-processing moved from ONNX (unsupported by Metis M2 AIPU) ----
+
+        # 1. Softmax over 65 channels, drop dustbin, pixel-shuffle → [1, 1, H, W]
+        scores_sm = torch.softmax(scores_logits, dim=1)
+        scores_no_dustbin = scores_sm[:, :-1, :, :]        # [1, 64, Hf, Wf]
+        score_map = F.pixel_shuffle(scores_no_dustbin, 8)  # [1, 1, H, W]
+
+        # 2. Single-pass max-pool NMS
+        k = 2 * self.nms_radius + 1
+        max_pool = F.max_pool2d(score_map, kernel_size=k, stride=1, padding=self.nms_radius)
+        score_map = score_map * (score_map == max_pool).float()
+
+        # 3. L2-normalise descriptor map
+        desc_norm = F.normalize(desc_map_raw, p=2, dim=1)  # [1, 256, Hf, Wf]
+
+        # ---- Keypoint extraction ----
         scores_2d = score_map.squeeze(0).squeeze(0)   # [H, W]
 
         # ---- 1. Border removal ----

@@ -1,15 +1,27 @@
 // SuperPoint post-processing GStreamer decoder for Axelera Metis M2
 //
-// The ONNX model already handles:
-//   - Softmax + pixel-shuffle  → score_map  [1, 1, H, W]  (NMS-suppressed)
-//   - Max-pool NMS             → suppressed score map
-//   - L2-normalisation         → desc_norm  [1, 256, Hf, Wf]
+// The ONNX model outputs raw tensors only (Conv/ReLU/MaxPool backbone + heads).
+// Post-processing ops (Softmax, PixelShuffle/Reshape/Transpose, Equal+Cast for
+// NMS, ReduceL2/Div) are unsupported by the Metis M2 AIPU compiler and are
+// handled here on the host CPU:
 //
-// This decoder only needs to run on the host CPU:
-//   1. Border removal + threshold → candidate keypoints
-//   2. Top-k selection            → final N keypoints
-//   3. Bilinear sampling of desc_norm at keypoint locations → [N, 256] descriptors
-//   4. Per-descriptor L2-normalise (bilinear blend of unit vectors isn't unit-norm)
+//   1. Transpose logits CHW→HWC   (cache-friendly gather for softmax)
+//   2. Softmax over 65 channels + dustbin removal + pixel-shuffle → score_map [H, W]
+//   3. Separable max-pool NMS (two 1-D passes, O(H·W·2k) vs naïve O(H·W·k²))
+//   4. Border removal + threshold → candidate keypoints
+//   5. Top-k selection → final N keypoints
+//   6. Transpose desc CHW→HWC     (cache-friendly bilinear sampling)
+//   7. Bilinear sampling + per-descriptor L2-normalise
+//
+// Performance notes (480×640, nms_radius=4, N=1024):
+//   Bottleneck        naïve          optimised       speedup
+//   NMS               ~25 M cmp      ~5.5 M cmp      ~4.5×
+//   Logit gather      strided ×65    sequential       cache-friendly
+//   Desc sampling     strided ×256   sequential       cache-friendly
+//   Heap alloc        ~7 MB/frame    once (Props)     zero per-frame
+//
+// Build flags that help further:  -O3 -ffast-math -mfpu=neon-vfpv4
+// For more cores:                 add -fopenmp and uncomment the pragmas below.
 //
 // Output stored as AxMetaRawTensor → deserialized by Python TensorMeta:
 //   tensors[0]  keypoints    [N, 2]    float32  (x, y) pixel coords
@@ -29,14 +41,26 @@
 #include <vector>
 
 // ---- Constants matching the SuperPoint architecture ----
-static constexpr int DESC_DIM = 256;
+static constexpr int DESC_DIM       = 256;
+static constexpr int LOGIT_CHANNELS = 65;   // 64 sub-pixel + 1 dustbin
+static constexpr int UPSCALE        = 8;    // VGG backbone stride
 
-// ---- Properties parsed from YAML options string ----
+// ---- Properties + pre-allocated frame buffers ----
 struct Props {
   std::string meta_name        = "superpoint";
   float       det_threshold    = 0.005f;
   int         remove_borders   = 4;
   int         max_keypoints    = 1024;   // ≤0 → unlimited
+  int         nms_radius       = 4;
+
+  // Working buffers resized once on first inference call (mutable because
+  // decode_to_meta receives a const Props*).
+  mutable int buf_H = 0, buf_W = 0, buf_Hf = 0, buf_Wf = 0;
+  mutable std::vector<float> logits_hwc;  // [Hf·Wf, 65]   CHW→HWC
+  mutable std::vector<float> score_map;   // [H, W]         pixel-shuffled scores
+  mutable std::vector<float> row_max;     // [H, W]         NMS horizontal pass
+  mutable std::vector<float> maxpool;     // [H, W]         NMS result
+  mutable std::vector<float> desc_hwc;    // [Hf·Wf, 256]   CHW→HWC
 };
 
 // ============================================================
@@ -51,22 +75,6 @@ l2_normalize(float* v, int n)
   for (int i = 0; i < n; ++i) sq += v[i] * v[i];
   float inv = 1.f / std::sqrt(sq + 1e-10f);
   for (int i = 0; i < n; ++i) v[i] *= inv;
-}
-
-// Bilinear sample from a single 2-D channel [Hf × Wf].
-// Coordinates (px, py) are in descriptor-map pixel space [0, Wf) × [0, Hf).
-static float
-bilinear(const float* ch, int Hf, int Wf, float px, float py)
-{
-  int x0 = std::max(0, std::min(Wf - 1, (int)std::floor(px)));
-  int y0 = std::max(0, std::min(Hf - 1, (int)std::floor(py)));
-  int x1 = std::min(Wf - 1, x0 + 1);
-  int y1 = std::min(Hf - 1, y0 + 1);
-  float wx = px - std::floor(px), wy = py - std::floor(py);
-  return (1 - wx) * (1 - wy) * ch[y0 * Wf + x0]
-       +      wx  * (1 - wy) * ch[y0 * Wf + x1]
-       + (1 - wx) *      wy  * ch[y1 * Wf + x0]
-       +      wx  *      wy  * ch[y1 * Wf + x1];
 }
 
 // ============================================================
@@ -93,10 +101,12 @@ init_and_set_static_properties(
   get("detection_threshold",p->det_threshold);
   get("remove_borders",     p->remove_borders);
   get("max_keypoints",      p->max_keypoints);
+  get("nms_radius",         p->nms_radius);
 
   log(AX_INFO) << "SuperPoint decoder init: threshold=" << p->det_threshold
                << " borders=" << p->remove_borders
-               << " max_kpts=" << p->max_keypoints;
+               << " max_kpts=" << p->max_keypoints
+               << " nms_radius=" << p->nms_radius;
   return p;
 }
 
@@ -104,7 +114,7 @@ const std::unordered_set<std::string>&
 allowed_properties()
 {
   static const std::unordered_set<std::string> s{
-    "meta_key", "detection_threshold", "remove_borders", "max_keypoints"
+    "meta_key", "detection_threshold", "remove_borders", "max_keypoints", "nms_radius"
   };
   return s;
 }
@@ -124,20 +134,21 @@ decode_to_meta(
     Ax::Logger&                log)
 try {
   // --- Identify tensors by channel count (AIPU may reorder outputs) ---
-  // score_map:  [1, 1,   H,  W ]  — NMS-suppressed softmax scores
-  // desc_norm:  [1, 256, Hf, Wf]  — L2-normalised descriptor map
-  const float* score_ptr = nullptr;
-  const float* desc_ptr  = nullptr;
-  int H = 0, W = 0, Hf = 0, Wf = 0;
+  // scores_logits: [1, 65,  Hf, Wf]  raw detector logits (pre-softmax)
+  // desc_map:      [1, 256, Hf, Wf]  raw descriptor map  (pre-L2-norm)
+  const float* logits_ptr = nullptr;
+  const float* desc_ptr   = nullptr;
+  int logits_Hf = 0, logits_Wf = 0;
+  int Hf = 0, Wf = 0;
 
   for (const auto& t : in_tensors) {
-    if (t.sizes.size() != 4 || t.bytes != 4) continue;  // expect float32 NCHW
-    if (!t.data) continue;                               // unmapped DMA buffer
+    if (t.sizes.size() != 4 || t.bytes != 4) continue;
+    if (!t.data) continue;
     int C = t.sizes[1];
-    if (C == 1) {
-      score_ptr = static_cast<const float*>(t.data);
-      H = t.sizes[2];
-      W = t.sizes[3];
+    if (C == LOGIT_CHANNELS) {
+      logits_ptr = static_cast<const float*>(t.data);
+      logits_Hf  = t.sizes[2];
+      logits_Wf  = t.sizes[3];
     } else if (C == DESC_DIM) {
       desc_ptr = static_cast<const float*>(t.data);
       Hf = t.sizes[2];
@@ -145,31 +156,150 @@ try {
     }
   }
 
-  if (!score_ptr || !desc_ptr || H == 0 || Hf == 0) {
-    log(AX_ERROR) << "SuperPoint: could not identify output tensors";
+  if (!logits_ptr || !desc_ptr || logits_Hf == 0 || Hf == 0) {
+    log(AX_ERROR) << "SuperPoint: could not identify output tensors "
+                     "(need C=65 logits and C=256 desc_map)";
     return;
   }
 
-  // Stride (H / Hf = 8 for SuperPoint VGG backbone)
-  const float stride = static_cast<float>(H) / static_cast<float>(Hf);
+  const int H    = logits_Hf * UPSCALE;
+  const int W    = logits_Wf * UPSCALE;
+  const int HfWf = logits_Hf * logits_Wf;
 
-  // ---- 1. Border removal + threshold → candidates ----
+  // --- Resize working buffers (once on first frame or on resolution change) ---
+  if (prop->buf_H != H || prop->buf_W != W ||
+      prop->buf_Hf != Hf || prop->buf_Wf != Wf) {
+    prop->buf_H = H;  prop->buf_W = W;
+    prop->buf_Hf = Hf; prop->buf_Wf = Wf;
+    prop->logits_hwc.resize(HfWf * LOGIT_CHANNELS);
+    prop->score_map.resize(H * W);
+    prop->row_max.resize(H * W);
+    prop->maxpool.resize(H * W);
+    prop->desc_hwc.resize(HfWf * DESC_DIM);
+  }
+
+  float* logits_hwc = prop->logits_hwc.data();
+  float* score_map  = prop->score_map.data();
+  float* row_max    = prop->row_max.data();
+  float* maxpool    = prop->maxpool.data();
+  float* desc_hwc   = prop->desc_hwc.data();
+
+  // =========================================================================
+  // Step 1: Transpose logits  CHW [65, Hf, Wf] → HWC [Hf·Wf, 65]
+  //
+  // The AIPU output is channel-major.  Reading column w of channel c requires
+  // jumping Hf·Wf floats per channel — terrible for softmax.  After this
+  // transpose, each cell's 65 logits are contiguous (4 cache lines).
+  // =========================================================================
+  // //#pragma omp parallel for schedule(static)
+  for (int c = 0; c < LOGIT_CHANNELS; ++c) {
+    const float* src = logits_ptr + c * HfWf;
+    for (int hw = 0; hw < HfWf; ++hw)
+      logits_hwc[hw * LOGIT_CHANNELS + c] = src[hw];
+  }
+
+  // =========================================================================
+  // Step 2: Softmax + pixel-shuffle → score_map [H, W]
+  //
+  // For each cell hw in [Hf·Wf]:
+  //   - Read 65 contiguous logits from logits_hwc[hw * 65 ..]
+  //   - Numerically-stable softmax (max subtraction)
+  //   - Drop dustbin (channel 64); scatter 64 values via pixel-shuffle
+  // =========================================================================
+  // //#pragma omp parallel for schedule(static)
+  for (int hw = 0; hw < HfWf; ++hw) {
+    const float* lv_in = logits_hwc + hw * LOGIT_CHANNELS;
+    const int    h     = hw / logits_Wf;
+    const int    w     = hw % logits_Wf;
+
+    // Softmax with max subtraction
+    float max_val = lv_in[0];
+    for (int c = 1; c < LOGIT_CHANNELS; ++c)
+      if (lv_in[c] > max_val) max_val = lv_in[c];
+
+    float lv[LOGIT_CHANNELS];
+    float sum_exp = 0.f;
+    for (int c = 0; c < LOGIT_CHANNELS; ++c) {
+      lv[c]    = std::exp(lv_in[c] - max_val);
+      sum_exp += lv[c];
+    }
+    const float inv_sum = 1.f / sum_exp;
+
+    // Pixel-shuffle: channel c → full-res offset (oh = c/8, ow = c%8)
+    for (int c = 0; c < LOGIT_CHANNELS - 1; ++c) {
+      score_map[(h * UPSCALE + c / UPSCALE) * W + (w * UPSCALE + c % UPSCALE)]
+          = lv[c] * inv_sum;
+    }
+  }
+
+  // =========================================================================
+  // Step 3: Separable max-pool NMS  (O(H·W·2k) vs naïve O(H·W·k²))
+  //
+  // 2D max-pool with a square kernel is separable: apply 1-D max-pool
+  // horizontally then vertically.  For nms_radius=4 (k=9, k²=81):
+  //   naïve:  307 200 × 81  ≈ 25 M comparisons
+  //   sep:    307 200 × 18  ≈  5.5 M comparisons  (~4.5× faster)
+  //
+  // NMS condition: keep pixel iff score == local_max (i.e. ≥ local_max,
+  // since local_max is computed over a window that includes the pixel itself).
+  // =========================================================================
+  const int r = prop->nms_radius;
+
+  // Pass 1 — horizontal: row_max[y][x] = max(score_map[y][x-r .. x+r])
+  // //#pragma omp parallel for schedule(static)
+  for (int y = 0; y < H; ++y) {
+    const float* src = score_map + y * W;
+    float*       dst = row_max   + y * W;
+    for (int x = 0; x < W; ++x) {
+      float m = 0.f;
+      const int x0 = x - r < 0     ? 0     : x - r;
+      const int x1 = x + r >= W    ? W - 1 : x + r;
+      for (int xx = x0; xx <= x1; ++xx)
+        if (src[xx] > m) m = src[xx];
+      dst[x] = m;
+    }
+  }
+
+  // Pass 2 — vertical: maxpool[y][x] = max(row_max[y-r .. y+r][x])
+  // //#pragma omp parallel for schedule(static)
+  for (int y = 0; y < H; ++y) {
+    float*    dst = maxpool + y * W;
+    const int y0  = y - r < 0     ? 0     : y - r;
+    const int y1  = y + r >= H    ? H - 1 : y + r;
+    for (int x = 0; x < W; ++x) {
+      float m = 0.f;
+      for (int yy = y0; yy <= y1; ++yy) {
+        float v = row_max[yy * W + x];
+        if (v > m) m = v;
+      }
+      dst[x] = m;
+    }
+  }
+
+  // Suppress non-maxima
+  for (int i = 0; i < H * W; ++i)
+    score_map[i] = score_map[i] >= maxpool[i] ? score_map[i] : 0.f;
+
+  // =========================================================================
+  // Step 4: Border removal + threshold → candidates
+  // =========================================================================
   struct Candidate { float score; int x, y; };
   std::vector<Candidate> cands;
   cands.reserve(4096);
 
   const int pad = prop->remove_borders;
-  for (int h = 0; h < H; ++h) {
-    if (h < pad || h >= H - pad) continue;
-    for (int w = 0; w < W; ++w) {
-      if (w < pad || w >= W - pad) continue;
-      float s = score_ptr[h * W + w];
+  for (int y = pad; y < H - pad; ++y) {
+    const float* row = score_map + y * W;
+    for (int x = pad; x < W - pad; ++x) {
+      float s = row[x];
       if (s > prop->det_threshold)
-        cands.push_back({ s, w, h });
+        cands.push_back({ s, x, y });
     }
   }
 
-  // ---- 2. Top-k selection ----
+  // =========================================================================
+  // Step 5: Top-k selection
+  // =========================================================================
   int N = static_cast<int>(cands.size());
   if (prop->max_keypoints > 0 && N > prop->max_keypoints) {
     std::partial_sort(cands.begin(), cands.begin() + prop->max_keypoints, cands.end(),
@@ -179,9 +309,27 @@ try {
   }
   log(AX_DEBUG) << "SuperPoint: " << N << " keypoints";
 
-  // ---- 3. Sample descriptors ----
-  // Descriptor-map coordinate for keypoint (x, y):
-  //   desc_x = (x + 0.5) / stride - 0.5   (follows SuperPoint grid_sample convention)
+  // =========================================================================
+  // Step 6: Transpose desc_map  CHW [256, Hf, Wf] → HWC [Hf·Wf, 256]
+  //
+  // With CHW layout, bilinear sampling a keypoint reads 4 pixels × 256 channels
+  // scattered at strides of Hf·Wf·4 = 19 200 bytes — one cache miss per channel.
+  // After HWC transpose, all 256 channels of a pixel are contiguous (1 KB),
+  // so the 4-neighbour bilinear fetch touches just ~4 cache lines per keypoint.
+  // =========================================================================
+  // //#pragma omp parallel for schedule(static)
+  for (int c = 0; c < DESC_DIM; ++c) {
+    const float* src = desc_ptr + c * HfWf;
+    for (int hw = 0; hw < HfWf; ++hw)
+      desc_hwc[hw * DESC_DIM + c] = src[hw];
+  }
+
+  // =========================================================================
+  // Step 7: Bilinear descriptor sampling + per-descriptor L2-normalise
+  //
+  // Descriptor-map coordinate for keypoint (x, y) in full-image pixel space:
+  //   desc_x = (x + 0.5) / stride - 0.5   (SuperPoint grid_sample convention)
+  // =========================================================================
   std::vector<float> kpts(N * 2);
   std::vector<float> scores_out(N);
   std::vector<float> descs(N * DESC_DIM, 0.f);
@@ -191,17 +339,38 @@ try {
     kpts[i * 2 + 1] = static_cast<float>(cands[i].y);
     scores_out[i]   = cands[i].score;
 
-    float dx = (cands[i].x + 0.5f) / stride - 0.5f;
-    float dy = (cands[i].y + 0.5f) / stride - 0.5f;
+    // Map to descriptor-map coordinates
+    const float px = (cands[i].x + 0.5f) / UPSCALE - 0.5f;
+    const float py = (cands[i].y + 0.5f) / UPSCALE - 0.5f;
 
+    const int   x0 = std::max(0,      std::min(Wf - 1, (int)std::floor(px)));
+    const int   y0 = std::max(0,      std::min(Hf - 1, (int)std::floor(py)));
+    const int   x1 = std::min(Wf - 1, x0 + 1);
+    const int   y1 = std::min(Hf - 1, y0 + 1);
+    const float wx = px - std::floor(px);
+    const float wy = py - std::floor(py);
+
+    const float w00 = (1.f - wx) * (1.f - wy);
+    const float w10 = wx         * (1.f - wy);
+    const float w01 = (1.f - wx) * wy;
+    const float w11 = wx         * wy;
+
+    // All four neighbour vectors are contiguous in HWC memory (256 floats each).
+    const float* p00 = desc_hwc + (y0 * Wf + x0) * DESC_DIM;
+    const float* p10 = desc_hwc + (y0 * Wf + x1) * DESC_DIM;
+    const float* p01 = desc_hwc + (y1 * Wf + x0) * DESC_DIM;
+    const float* p11 = desc_hwc + (y1 * Wf + x1) * DESC_DIM;
+
+    float* out = descs.data() + i * DESC_DIM;
     for (int c = 0; c < DESC_DIM; ++c)
-      descs[i * DESC_DIM + c] = bilinear(desc_ptr + c * Hf * Wf, Hf, Wf, dx, dy);
+      out[c] = w00 * p00[c] + w10 * p10[c] + w01 * p01[c] + w11 * p11[c];
 
-    // 4. Per-descriptor L2-normalise (bilinear blend of unit vectors isn't unit-norm)
-    l2_normalize(&descs[i * DESC_DIM], DESC_DIM);
+    l2_normalize(out, DESC_DIM);
   }
 
-  // ---- 5. Store as AxMetaRawTensor (→ Python TensorMeta) ----
+  // =========================================================================
+  // Store as AxMetaRawTensor (→ Python TensorMeta)
+  // =========================================================================
   auto* meta = ax_utils::insert_meta<AxMetaRawTensor>(
       map, prop->meta_name, std::string{}, subframe_index, subframe_number);
   if (!meta) {
@@ -217,11 +386,8 @@ try {
   const float* scr_data   = N > 0 ? scores_out.data(): &kEmpty;
   const float* desc_data  = N > 0 ? descs.data()     : &kEmpty;
 
-  // tensors[0]: keypoints  [N, 2]
   meta->add_tensor(kpts_data,  N * 2,        sizeof(float), { N, 2 });
-  // tensors[1]: scores     [N]
   meta->add_tensor(scr_data,   N,             sizeof(float), { N });
-  // tensors[2]: descriptors [N, 256]
   meta->add_tensor(desc_data,  N * DESC_DIM, sizeof(float), { N, DESC_DIM });
 }
 catch (const std::exception& e) {

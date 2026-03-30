@@ -316,3 +316,11 @@
 39152	40493	1774428250025692589	customers/tutorials/libdecode_superpoint.so	f88ac67c33a5bd72
 39877	41121	1774428250653704561	libtransform_paddingdequantize.so	891f2b766ae0ebab
 41121	41559	0	CMakeFiles/install.util	b535f1025a7bf9ef
+40	20203	1774451796214216803	CMakeFiles/inplace_normalize.dir/src/AxInPlaceNormalize.cpp.o	a0024aa2740a73e7
+20203	21305	1774451797310245505	libinplace_normalize.so	51906b217b15627f
+41	37962	1774451813966681691	customers/tutorials/CMakeFiles/decode_superpoint.dir/src/decode_superpoint.cc.o	bb7351821b75b295
+37963	39021	1774451815018709241	customers/tutorials/libdecode_superpoint.so	f88ac67c33a5bd72
+39021	39293	0	CMakeFiles/install.util	b535f1025a7bf9ef
+39	37472	1774860118885512290	customers/tutorials/CMakeFiles/decode_superpoint.dir/src/decode_superpoint.cc.o	bb7351821b75b295
+37472	38732	1774860120141541069	customers/tutorials/libdecode_superpoint.so	f88ac67c33a5bd72
+38733	39043	0	CMakeFiles/install.util	b535f1025a7bf9ef

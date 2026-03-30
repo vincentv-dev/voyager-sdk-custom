@@ -116,9 +116,17 @@ def _old_postprocess(scores_logits, desc_map_raw,
     return kpts.cpu().numpy(), kpt_scores.cpu().numpy(), descs.cpu().numpy()
 
 
-def _new_postprocess(score_map, desc_norm,
-                     threshold=0.005, remove_borders=4, max_keypoints=1024):
-    """New pipeline: score_map already NMS-suppressed; just extract kpts."""
+def _new_postprocess(scores_logits, desc_map_raw,
+                     nms_radius=4, threshold=0.005,
+                     remove_borders=4, max_keypoints=1024):
+    """New pipeline: single-pass max-pool NMS (matches SuperPointDecoder)."""
+    s = F.softmax(scores_logits, dim=1)[:, :-1]   # [1, 64, Hf, Wf]
+    score_map = F.pixel_shuffle(s, 8)              # [1, 1, H, W]
+
+    k = 2 * nms_radius + 1
+    max_pool = F.max_pool2d(score_map, kernel_size=k, stride=1, padding=nms_radius)
+    score_map = score_map * (score_map == max_pool).float()
+
     scores_2d = score_map.squeeze(0).squeeze(0).clone()
 
     pad = remove_borders
@@ -134,6 +142,7 @@ def _new_postprocess(score_map, desc_norm,
         kpt_scores, idx = torch.topk(kpt_scores, max_keypoints)
         kpts = kpts[idx]
 
+    desc_norm = F.normalize(desc_map_raw, p=2, dim=1)
     _, c, hf, wf = desc_norm.shape
     stride = score_map.shape[2] // hf
     norm_kpts = (kpts + 0.5) / (kpts.new_tensor([wf, hf]) * stride)
@@ -212,29 +221,18 @@ def main():
 
     raw_enc = _RawEncoder(sp).eval()
 
-    from export_onnx import SuperPointEncoder
-    new_enc = SuperPointEncoder(sp, nms_radius=args.nms_radius).eval()
-
     # ---- Load image ----
     image_t, orig_img = _load_frame(args.input, args.height, args.width)
     print(f"Input: {args.input}  →  {args.width}×{args.height} grayscale")
 
-    # ---- Run both pipelines ----
+    # ---- Run both pipelines (both use raw logits; differ only in NMS strategy) ----
     with torch.no_grad():
         scores_logits, desc_map_raw = raw_enc(image_t)
-        score_map, desc_norm = new_enc(image_t)
-
-    # ---- Sanity-check model outputs ----
-    assert score_map.min() >= 0, "score_map has negative values"
-    assert score_map.max() <= 1 + 1e-4, f"score_map max {score_map.max():.5f} > 1"
-    norms = desc_norm.norm(dim=1)
-    assert norms.min() > 0.99, f"desc_norm not unit: min={norms.min():.4f}"
 
     kw = dict(nms_radius=args.nms_radius, threshold=args.threshold,
               max_keypoints=args.max_keypoints)
     old_kpts, old_scr, old_desc = _old_postprocess(scores_logits, desc_map_raw, **kw)
-    new_kw = dict(threshold=args.threshold, max_keypoints=args.max_keypoints)
-    new_kpts, new_scr, new_desc = _new_postprocess(score_map, desc_norm, **new_kw)
+    new_kpts, new_scr, new_desc = _new_postprocess(scores_logits, desc_map_raw, **kw)
 
     # ---- Report ----
     print(f"\n{'':=<62}")

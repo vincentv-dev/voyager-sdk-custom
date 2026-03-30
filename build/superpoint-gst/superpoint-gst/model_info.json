@@ -16,11 +16,11 @@
     {
       "shape": [
         1,
-        1,
-        480,
-        640
+        65,
+        60,
+        80
       ],
-      "name": "score_map",
+      "name": "scores_logits",
       "dtype": "tensor(float)"
     },
     {
@@ -30,7 +30,7 @@
         60,
         80
       ],
-      "name": "desc_norm",
+      "name": "desc_map",
       "dtype": "tensor(float)"
     }
   ],
