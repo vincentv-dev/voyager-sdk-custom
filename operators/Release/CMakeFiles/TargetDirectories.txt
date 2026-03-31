@@ -156,6 +156,7 @@
 /home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/decode_tu9.dir
 /home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/inplace_tu9.dir
 /home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/decode_superpoint.dir
+/home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/decode_edgepoint.dir
 /home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/test.dir
 /home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/edit_cache.dir
 /home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/rebuild_cache.dir

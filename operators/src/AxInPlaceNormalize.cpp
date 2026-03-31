@@ -372,6 +372,49 @@ inplace(const AxDataInterface &data, const normalize_properties *details,
 #endif
   }
 
+#ifdef USE_NEON
+  // Auto-NEON for single-channel uint8 (common GRAY input for inference pipelines)
+  if (tensor.bytes == 1 && ch_dim == 3 && num_ch == 1) {
+    float32x4_t mul_v = vdupq_n_f32(muls[0]);
+    float32x4_t add_v = vdupq_n_f32(adds[0]);
+    float32x4_t min_v = vdupq_n_f32(-128.0f);
+    float32x4_t max_v = vdupq_n_f32(127.0f);
+
+    const size_t total    = tensor.total();
+    const size_t n_chunks = total / 16;
+    uint8_t *in_ptr  = static_cast<uint8_t *>(tensor.data);
+    int8_t  *out_ptr = static_cast<int8_t  *>(tensor.data);
+
+    for (size_t i = 0; i < n_chunks; ++i) {
+      uint8x16_t u8  = vld1q_u8(in_ptr);  in_ptr += 16;
+      uint16x8_t lo16 = vmovl_u8(vget_low_u8(u8));
+      uint16x8_t hi16 = vmovl_u8(vget_high_u8(u8));
+
+      float32x4_t f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16)));
+      float32x4_t f1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16)));
+      float32x4_t f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16)));
+      float32x4_t f3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16)));
+
+      int32x4_t s0 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmlaq_f32(add_v, f0, mul_v), min_v), max_v));
+      int32x4_t s1 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmlaq_f32(add_v, f1, mul_v), min_v), max_v));
+      int32x4_t s2 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmlaq_f32(add_v, f2, mul_v), min_v), max_v));
+      int32x4_t s3 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmlaq_f32(add_v, f3, mul_v), min_v), max_v));
+
+      int8x8_t r01 = vmovn_s16(vcombine_s16(vmovn_s32(s0), vmovn_s32(s1)));
+      int8x8_t r23 = vmovn_s16(vcombine_s16(vmovn_s32(s2), vmovn_s32(s3)));
+
+      vst1_s8(out_ptr,     r01);
+      vst1_s8(out_ptr + 8, r23);
+      out_ptr += 16;
+    }
+    for (size_t i = n_chunks * 16; i < total; ++i) {
+      uint8_t val = static_cast<uint8_t *>(tensor.data)[i];
+      static_cast<int8_t *>(tensor.data)[i] = clamp_and_round(val * muls[0] + adds[0]);
+    }
+    return;
+  }
+#endif
+
   int inner = 1;
   int outer = 1;
   for (int i = 0; i < ch_dim; ++i) {

@@ -7,6 +7,11 @@
 #include "AxMeta.hpp"
 #include "AxOpUtils.hpp"
 
+#if defined __ARM_NEON
+#include <arm_neon.h>
+#define USE_NEON_DEQUANT
+#endif
+
 namespace
 {
 using lookups = std::array<float, 256>;
@@ -224,22 +229,52 @@ transform(const AxDataInterface &input, const AxDataInterface &output,
     float *outptr = output_mat.ptr<float>();
 
     if (!should_transpose) {
-      std::transform(inptr, inptr + cropped.total(), outptr,
-          [&dequantize_lookups](
-              int8_t val) { return dequantize(val, dequantize_lookups); });
+      const auto total = static_cast<ptrdiff_t>(cropped.total());
+      const float scale = prop->dequant_scale[i];
+      const float bias  = -prop->dequant_zeropoint[i] * scale;
+#ifdef USE_NEON_DEQUANT
+      const ptrdiff_t n_vec = total / 8;
+      float32x4_t scale_v = vdupq_n_f32(scale);
+      float32x4_t bias_v  = vdupq_n_f32(bias);
+#pragma omp parallel for schedule(static)
+      for (ptrdiff_t j = 0; j < n_vec; ++j) {
+        int8x8_t  in8  = vld1_s8(inptr + j * 8);
+        int16x8_t in16 = vmovl_s8(in8);
+        float32x4_t flo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(in16)));
+        float32x4_t fhi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(in16)));
+        vst1q_f32(outptr + j * 8,     vmlaq_f32(bias_v, flo, scale_v));
+        vst1q_f32(outptr + j * 8 + 4, vmlaq_f32(bias_v, fhi, scale_v));
+      }
+      for (ptrdiff_t j = n_vec * 8; j < total; ++j) {
+        outptr[j] = scale * static_cast<float>(inptr[j]) + bias;
+      }
+#else
+#pragma omp parallel for schedule(static)
+      for (ptrdiff_t j = 0; j < total; ++j) {
+        outptr[j] = dequantize(inptr[j], dequantize_lookups);
+      }
+#endif
     } else {
-      const int sh = W * C;
-      const int sn = H * sh;
+      const int out_CH = H * W;
+      const int out_N  = C * out_CH;
+      const int in_sh  = W * C;
+      const int in_sn  = H * in_sh;
+#pragma omp parallel for collapse(2) schedule(static)
       for (int iN = 0; iN < N; ++iN) {
         for (int iC = 0; iC < C; ++iC) {
           for (int iH = 0; iH < H; ++iH) {
-            for (int iW = 0; iW < W; ++iW) {
-              int input_index = iN * sn + iH * sh + iW * C + iC;
-              *outptr++ = prop->dequant_lut ?
-                              dequantize(inptr[input_index], dequantize_lookups) :
-                              prop->dequant_scale[i]
-                                  * (static_cast<float>(inptr[input_index])
-                                      - prop->dequant_zeropoint[i]);
+            const int8_t *in_row  = inptr  + iN * in_sn + iH * in_sh + iC;
+            float        *out_row = outptr + iN * out_N  + iC * out_CH + iH * W;
+            if (prop->dequant_lut) {
+              for (int iW = 0; iW < W; ++iW) {
+                out_row[iW] = dequantize(in_row[iW * C], dequantize_lookups);
+              }
+            } else {
+              const float scale = prop->dequant_scale[i];
+              const float zp    = prop->dequant_zeropoint[i];
+              for (int iW = 0; iW < W; ++iW) {
+                out_row[iW] = scale * (static_cast<float>(in_row[iW * C]) - zp);
+              }
             }
           }
         }

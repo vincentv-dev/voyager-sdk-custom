@@ -65,3 +65,4 @@
 /home/Vydar/voyager-sdk-custom/operators/lib/libdecode_tu9.so
 /home/Vydar/voyager-sdk-custom/operators/lib/libinplace_tu9.so
 /home/Vydar/voyager-sdk-custom/operators/lib/libdecode_superpoint.so
+/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so

@@ -5,19 +5,25 @@
 // NMS, ReduceL2/Div) are unsupported by the Metis M2 AIPU compiler and are
 // handled here on the host CPU:
 //
-//   1. Transpose logits CHW→HWC   (cache-friendly gather for softmax)
-//   2. Softmax over 65 channels + dustbin removal + pixel-shuffle → score_map [H, W]
-//   3. Separable max-pool NMS (two 1-D passes, O(H·W·2k) vs naïve O(H·W·k²))
-//   4. Border removal + threshold → candidate keypoints
-//   5. Top-k selection → final N keypoints
-//   6. Transpose desc CHW→HWC     (cache-friendly bilinear sampling)
-//   7. Bilinear sampling + per-descriptor L2-normalise
+//   1. Softmax over 65 channels + dustbin removal + pixel-shuffle → score_map [H, W]
+//   2. Separable max-pool NMS (two 1-D passes, O(H·W·2k) vs naïve O(H·W·k²))
+//   3. Border removal + threshold → candidate keypoints
+//   4. Top-k selection → final N keypoints
+//   5. Bilinear sampling + per-descriptor L2-normalise
+//
+// Input tensor layout: NHWC float32  (handle_transpose: false in the YAML)
+//
+//   The SDK's dequantize transform outputs NHWC float32 without transposing.
+//   NHWC data is already channel-contiguous per spatial cell — logits_ptr[hw*65+c]
+//   and desc_ptr[hw*256+c] — so no CHW→HWC scatter-gather is needed.
+//   This eliminates two full-tensor transpose passes vs the old NCHW path:
+//     - old: NHWC int8 → NCHW float32 (SDK) → HWC float32 (decoder) — 2 passes
+//     - new: NHWC int8 → NHWC float32 (SDK) — direct use, 0 extra passes
 //
 // Performance notes (480×640, nms_radius=4, N=1024):
 //   Bottleneck        naïve          optimised       speedup
 //   NMS               ~25 M cmp      ~5.5 M cmp      ~4.5×
-//   Logit gather      strided ×65    sequential       cache-friendly
-//   Desc sampling     strided ×256   sequential       cache-friendly
+//   CHW→HWC passes    2 × ~6 MB      eliminated       ∞
 //   Heap alloc        ~7 MB/frame    once (Props)     zero per-frame
 //
 // Build flags that help further:  -O3 -ffast-math -mfpu=neon-vfpv4
@@ -55,12 +61,12 @@ struct Props {
 
   // Working buffers resized once on first inference call (mutable because
   // decode_to_meta receives a const Props*).
+  // logits_hwc and desc_hwc are no longer needed: NHWC tensors arrive already
+  // in channel-contiguous (HWC) order from the dequantize transform.
   mutable int buf_H = 0, buf_W = 0, buf_Hf = 0, buf_Wf = 0;
-  mutable std::vector<float> logits_hwc;  // [Hf·Wf, 65]   CHW→HWC
-  mutable std::vector<float> score_map;   // [H, W]         pixel-shuffled scores
-  mutable std::vector<float> row_max;     // [H, W]         NMS horizontal pass
-  mutable std::vector<float> maxpool;     // [H, W]         NMS result
-  mutable std::vector<float> desc_hwc;    // [Hf·Wf, 256]   CHW→HWC
+  mutable std::vector<float> score_map;   // [H, W]   pixel-shuffled scores
+  mutable std::vector<float> row_max;     // [H, W]   NMS horizontal pass
+  mutable std::vector<float> maxpool;     // [H, W]   NMS result
 };
 
 // ============================================================
@@ -134,8 +140,9 @@ decode_to_meta(
     Ax::Logger&                log)
 try {
   // --- Identify tensors by channel count (AIPU may reorder outputs) ---
-  // scores_logits: [1, 65,  Hf, Wf]  raw detector logits (pre-softmax)
-  // desc_map:      [1, 256, Hf, Wf]  raw descriptor map  (pre-L2-norm)
+  // Tensors arrive as NHWC float32 (handle_transpose: false):
+  // scores_logits: [1, Hf, Wf, 65]   raw detector logits (pre-softmax)
+  // desc_map:      [1, Hf, Wf, 256]  raw descriptor map  (pre-L2-norm)
   const float* logits_ptr = nullptr;
   const float* desc_ptr   = nullptr;
   int logits_Hf = 0, logits_Wf = 0;
@@ -144,15 +151,15 @@ try {
   for (const auto& t : in_tensors) {
     if (t.sizes.size() != 4 || t.bytes != 4) continue;
     if (!t.data) continue;
-    int C = t.sizes[1];
+    int C = t.sizes[3];   // NHWC: channel is the last dimension
     if (C == LOGIT_CHANNELS) {
       logits_ptr = static_cast<const float*>(t.data);
-      logits_Hf  = t.sizes[2];
-      logits_Wf  = t.sizes[3];
+      logits_Hf  = t.sizes[1];
+      logits_Wf  = t.sizes[2];
     } else if (C == DESC_DIM) {
       desc_ptr = static_cast<const float*>(t.data);
-      Hf = t.sizes[2];
-      Wf = t.sizes[3];
+      Hf = t.sizes[1];
+      Wf = t.sizes[2];
     }
   }
 
@@ -171,35 +178,21 @@ try {
       prop->buf_Hf != Hf || prop->buf_Wf != Wf) {
     prop->buf_H = H;  prop->buf_W = W;
     prop->buf_Hf = Hf; prop->buf_Wf = Wf;
-    prop->logits_hwc.resize(HfWf * LOGIT_CHANNELS);
     prop->score_map.resize(H * W);
     prop->row_max.resize(H * W);
     prop->maxpool.resize(H * W);
-    prop->desc_hwc.resize(HfWf * DESC_DIM);
   }
 
-  float* logits_hwc = prop->logits_hwc.data();
-  float* score_map  = prop->score_map.data();
-  float* row_max    = prop->row_max.data();
-  float* maxpool    = prop->maxpool.data();
-  float* desc_hwc   = prop->desc_hwc.data();
+  // NHWC data is already channel-contiguous per cell: ptr[hw * C + c].
+  // No CHW→HWC transpose needed — alias the tensor pointers directly.
+  const float* logits_hwc = logits_ptr;   // [Hf·Wf, 65]
+  float*       score_map  = prop->score_map.data();
+  float*       row_max    = prop->row_max.data();
+  float*       maxpool    = prop->maxpool.data();
+  const float* desc_hwc   = desc_ptr;     // [Hf·Wf, 256]
 
   // =========================================================================
-  // Step 1: Transpose logits  CHW [65, Hf, Wf] → HWC [Hf·Wf, 65]
-  //
-  // The AIPU output is channel-major.  Reading column w of channel c requires
-  // jumping Hf·Wf floats per channel — terrible for softmax.  After this
-  // transpose, each cell's 65 logits are contiguous (4 cache lines).
-  // =========================================================================
-  // //#pragma omp parallel for schedule(static)
-  for (int c = 0; c < LOGIT_CHANNELS; ++c) {
-    const float* src = logits_ptr + c * HfWf;
-    for (int hw = 0; hw < HfWf; ++hw)
-      logits_hwc[hw * LOGIT_CHANNELS + c] = src[hw];
-  }
-
-  // =========================================================================
-  // Step 2: Softmax + pixel-shuffle → score_map [H, W]
+  // Step 1: Softmax + pixel-shuffle → score_map [H, W]
   //
   // For each cell hw in [Hf·Wf]:
   //   - Read 65 contiguous logits from logits_hwc[hw * 65 ..]
@@ -233,7 +226,7 @@ try {
   }
 
   // =========================================================================
-  // Step 3: Separable max-pool NMS  (O(H·W·2k) vs naïve O(H·W·k²))
+  // Step 2: Separable max-pool NMS  (O(H·W·2k) vs naïve O(H·W·k²))
   //
   // 2D max-pool with a square kernel is separable: apply 1-D max-pool
   // horizontally then vertically.  For nms_radius=4 (k=9, k²=81):
@@ -281,7 +274,7 @@ try {
     score_map[i] = score_map[i] >= maxpool[i] ? score_map[i] : 0.f;
 
   // =========================================================================
-  // Step 4: Border removal + threshold → candidates
+  // Step 3: Border removal + threshold → candidates
   // =========================================================================
   struct Candidate { float score; int x, y; };
   std::vector<Candidate> cands;
@@ -298,7 +291,7 @@ try {
   }
 
   // =========================================================================
-  // Step 5: Top-k selection
+  // Step 4: Top-k selection
   // =========================================================================
   int N = static_cast<int>(cands.size());
   if (prop->max_keypoints > 0 && N > prop->max_keypoints) {
@@ -310,29 +303,18 @@ try {
   log(AX_DEBUG) << "SuperPoint: " << N << " keypoints";
 
   // =========================================================================
-  // Step 6: Transpose desc_map  CHW [256, Hf, Wf] → HWC [Hf·Wf, 256]
+  // Step 5: Bilinear descriptor sampling + per-descriptor L2-normalise
   //
-  // With CHW layout, bilinear sampling a keypoint reads 4 pixels × 256 channels
-  // scattered at strides of Hf·Wf·4 = 19 200 bytes — one cache miss per channel.
-  // After HWC transpose, all 256 channels of a pixel are contiguous (1 KB),
-  // so the 4-neighbour bilinear fetch touches just ~4 cache lines per keypoint.
-  // =========================================================================
-  // //#pragma omp parallel for schedule(static)
-  for (int c = 0; c < DESC_DIM; ++c) {
-    const float* src = desc_ptr + c * HfWf;
-    for (int hw = 0; hw < HfWf; ++hw)
-      desc_hwc[hw * DESC_DIM + c] = src[hw];
-  }
-
-  // =========================================================================
-  // Step 7: Bilinear descriptor sampling + per-descriptor L2-normalise
+  // desc_hwc aliases desc_ptr (NHWC): all 256 channels of each cell are
+  // already contiguous, so the 4-neighbour bilinear fetch is cache-friendly
+  // without any prior transpose.
   //
   // Descriptor-map coordinate for keypoint (x, y) in full-image pixel space:
   //   desc_x = (x + 0.5) / stride - 0.5   (SuperPoint grid_sample convention)
   // =========================================================================
   std::vector<float> kpts(N * 2);
   std::vector<float> scores_out(N);
-  std::vector<float> descs(N * DESC_DIM, 0.f);
+  std::vector<float> descs(N * DESC_DIM);
 
   for (int i = 0; i < N; ++i) {
     kpts[i * 2 + 0] = static_cast<float>(cands[i].x);

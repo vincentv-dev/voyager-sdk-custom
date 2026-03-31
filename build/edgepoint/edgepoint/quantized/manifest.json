@@ -1,0 +1,52 @@
+{
+  "quantized_model_file": "quantized_model.pt",
+  "input_shapes": [
+    [
+      1,
+      1,
+      512,
+      512
+    ]
+  ],
+  "input_dtypes": [
+    "float32"
+  ],
+  "output_shapes": [
+    [
+      1,
+      64,
+      256,
+      256
+    ],
+    [
+      1,
+      64,
+      64,
+      64
+    ],
+    [
+      1,
+      64,
+      16,
+      16
+    ]
+  ],
+  "output_dtypes": [
+    "float32",
+    "float32",
+    "float32"
+  ],
+  "input_shapes_original": null,
+  "output_shapes_original": null,
+  "quantize_params": [],
+  "dequantize_params": [],
+  "input_names": null,
+  "model_lib_file": null,
+  "model_params_file": null,
+  "n_padded_ch_inputs": null,
+  "n_padded_ch_outputs": null,
+  "input_tensor_layout": null,
+  "preprocess_graph": null,
+  "postprocess_graph": null,
+  "manifest_version": "1.1"
+}

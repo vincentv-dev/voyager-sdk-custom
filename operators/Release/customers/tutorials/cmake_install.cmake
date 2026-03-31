@@ -252,6 +252,41 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT
   include("/home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/decode_superpoint.dir/install-cxx-module-bmi-Release.cmake" OPTIONAL)
 endif()
 
+if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT)
+  if(EXISTS "$ENV{DESTDIR}/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so" AND
+     NOT IS_SYMLINK "$ENV{DESTDIR}/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so")
+    file(RPATH_CHECK
+         FILE "$ENV{DESTDIR}/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so"
+         RPATH "")
+  endif()
+  list(APPEND CMAKE_ABSOLUTE_DESTINATION_FILES
+   "/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so")
+  if(CMAKE_WARN_ON_ABSOLUTE_INSTALL_DESTINATION)
+    message(WARNING "ABSOLUTE path INSTALL DESTINATION : ${CMAKE_ABSOLUTE_DESTINATION_FILES}")
+  endif()
+  if(CMAKE_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION)
+    message(FATAL_ERROR "ABSOLUTE path INSTALL DESTINATION forbidden (by caller): ${CMAKE_ABSOLUTE_DESTINATION_FILES}")
+  endif()
+  file(INSTALL DESTINATION "/home/Vydar/voyager-sdk-custom/operators/lib" TYPE SHARED_LIBRARY MESSAGE_LAZY FILES "/home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/libdecode_edgepoint.so")
+  if(EXISTS "$ENV{DESTDIR}/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so" AND
+     NOT IS_SYMLINK "$ENV{DESTDIR}/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so")
+    file(RPATH_CHANGE
+         FILE "$ENV{DESTDIR}/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so"
+         OLD_RPATH "/home/Vydar/voyager-sdk-custom/operators/onnxruntime/onnxruntime/lib:/opt/axelera/runtime-1.5.3-1/lib:/home/Vydar/voyager-sdk-custom/operators/Release/trackers:/home/Vydar/voyager-sdk-custom/operators/Release/axstreamer:/home/Vydar/voyager-sdk-custom/operators/Release/trackers/axtracker:/home/Vydar/voyager-sdk-custom/operators/Release/trackers/algorithms/bytetrack:/home/Vydar/voyager-sdk-custom/operators/Release/trackers/algorithms/oc_sort:"
+         NEW_RPATH "")
+    if(CMAKE_INSTALL_DO_STRIP)
+      execute_process(COMMAND "/usr/bin/strip" "$ENV{DESTDIR}/home/Vydar/voyager-sdk-custom/operators/lib/libdecode_edgepoint.so")
+    endif()
+  endif()
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT)
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT)
+  include("/home/Vydar/voyager-sdk-custom/operators/Release/customers/tutorials/CMakeFiles/decode_edgepoint.dir/install-cxx-module-bmi-Release.cmake" OPTIONAL)
+endif()
+
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
 if(CMAKE_INSTALL_LOCAL_ONLY)

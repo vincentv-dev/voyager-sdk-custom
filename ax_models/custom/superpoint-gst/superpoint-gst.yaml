@@ -39,9 +39,14 @@ pipeline:
         # Convert HxWx1 uint8 → 1x1xHxW float32 in [0, 1]
         - torch-totensor:
       inference:
-        # handle_all: true  →  the SDK dequantizes + transposes the AIPU outputs
-        # so exec_torch receives clean float32 tensors matching the original model.
-        handle_all: true
+        # Skip NHWC→NCHW transpose: the SDK dequantizes int8→float32 but leaves
+        # tensors in NHWC layout.  The C++ decoder reads NHWC directly, so the
+        # double transpose (NHWC→NCHW in the SDK, NCHW→HWC in the decoder) is
+        # eliminated entirely — saving two full passes over both output tensors.
+        handle_preamble: true
+        handle_dequantization_and_depadding: true
+        handle_transpose: false
+        handle_postamble: false   # no postprocess ONNX graph — this is a no-op
       postprocess:
         - superpoint-decoder:
             detection_threshold: 0.005
