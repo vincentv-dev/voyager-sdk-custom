@@ -14,4 +14,6 @@ add_customer_libraries(tutorials
 if(OpenMP_CXX_FOUND)
     target_compile_options(decode_edgepoint PRIVATE ${OpenMP_CXX_FLAGS})
     target_link_libraries(decode_edgepoint PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_options(decode_superpoint PRIVATE ${OpenMP_CXX_FLAGS})
+    target_link_libraries(decode_superpoint PRIVATE OpenMP::OpenMP_CXX)
 endif()

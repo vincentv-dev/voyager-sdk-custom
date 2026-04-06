@@ -1,0 +1,123 @@
+{
+  "name": "kernel_function",
+  "type": "default",
+  "version": "4.0",
+  "generation": "omega",
+  "memory_pools": [
+    {
+      "name": "pool_ddr",
+      "size": 1638400,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 1
+    },
+    {
+      "name": "pool_ddr_const",
+      "size": 10117120,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 1,
+      "blob_file": "pool_ddr_const.bin"
+    },
+    {
+      "name": "pool_ddr_input",
+      "size": 1689856,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 2
+    },
+    {
+      "name": "pool_ddr_output",
+      "size": 2150400,
+      "alignment": 64,
+      "memory": "ddr",
+      "depth": 2
+    },
+    {
+      "name": "pool_l2",
+      "size": 1638400,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1
+    },
+    {
+      "name": "pool_l2_const",
+      "size": 6403584,
+      "alignment": 64,
+      "memory": "l2",
+      "depth": 1,
+      "blob_file": "pool_l2_const.bin"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "var_input_ifd0",
+      "memory_pool": "pool_ddr_input",
+      "offset": 0,
+      "size": 1689856,
+      "shape": [
+        1,
+        644,
+        656,
+        4
+      ],
+      "dtype": "int8"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "output_mmio_var",
+      "memory_pool": "pool_ddr_output",
+      "offset": 0,
+      "size": 409600,
+      "shape": [
+        1,
+        40,
+        40,
+        256
+      ],
+      "dtype": "int8"
+    },
+    {
+      "name": "output_mmio_var_1",
+      "memory_pool": "pool_ddr_output",
+      "offset": 2048000,
+      "size": 102400,
+      "shape": [
+        1,
+        20,
+        20,
+        256
+      ],
+      "dtype": "int8"
+    },
+    {
+      "name": "output_mmio_var_2",
+      "memory_pool": "pool_ddr_output",
+      "offset": 409600,
+      "size": 1638400,
+      "shape": [
+        1,
+        80,
+        80,
+        256
+      ],
+      "dtype": "int8"
+    }
+  ],
+  "kernels": [
+    {
+      "name": "kernel_function",
+      "arguments": [
+        "pool_ddr",
+        "pool_ddr_const",
+        "pool_ddr_input",
+        "pool_ddr_output",
+        "pool_l2",
+        "pool_l2_const"
+      ],
+      "pipeline_stage": 0,
+      "source_file": "kernel_function.c"
+    }
+  ]
+}

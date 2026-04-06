@@ -17,5 +17,5 @@ preprocess3_batch=1
 postprocess0_lib=libtransform_paddingdequantize.so
 postprocess0_options=padding:0,0,0,0,0,0,0,0|0,0,0,0,0,0,0,-63;dequant_scale:0.004440053831785917,0.09531740844249725;dequant_zeropoint:-2,8;transpose:0,0;dequant_lut:1
 postprocess1_lib=libdecode_superpoint.so
-postprocess1_options=meta_key:superpoint;detection_threshold:0.005;remove_borders:4;max_keypoints:1024;nms_radius:4
+postprocess1_options=meta_key:superpoint;detection_threshold:0.005;remove_borders:4;max_keypoints:512;nms_radius:4
 postprocess1_mode=read

@@ -66,7 +66,8 @@ struct Props {
   mutable int buf_H = 0, buf_W = 0, buf_Hf = 0, buf_Wf = 0;
   mutable std::vector<float> score_map;   // [H, W]   pixel-shuffled scores
   mutable std::vector<float> row_max;     // [H, W]   NMS horizontal pass
-  mutable std::vector<float> maxpool;     // [H, W]   NMS result
+  mutable std::vector<float> maxpool;     // [H, W]   NMS result / van Herk suffix temp
+  mutable std::vector<float> nms_prefix;  // [H, W]   van Herk prefix buffer
 };
 
 // ============================================================
@@ -181,6 +182,7 @@ try {
     prop->score_map.resize(H * W);
     prop->row_max.resize(H * W);
     prop->maxpool.resize(H * W);
+    prop->nms_prefix.resize(H * W);
   }
 
   // NHWC data is already channel-contiguous per cell: ptr[hw * C + c].
@@ -199,7 +201,7 @@ try {
   //   - Numerically-stable softmax (max subtraction)
   //   - Drop dustbin (channel 64); scatter 64 values via pixel-shuffle
   // =========================================================================
-  // //#pragma omp parallel for schedule(static)
+  #pragma omp parallel for schedule(static)
   for (int hw = 0; hw < HfWf; ++hw) {
     const float* lv_in = logits_hwc + hw * LOGIT_CHANNELS;
     const int    h     = hw / logits_Wf;
@@ -226,35 +228,51 @@ try {
   }
 
   // =========================================================================
-  // Step 2: Separable max-pool NMS  (O(H·W·2k) vs naïve O(H·W·k²))
+  // Step 2: Separable max-pool NMS
   //
-  // 2D max-pool with a square kernel is separable: apply 1-D max-pool
-  // horizontally then vertically.  For nms_radius=4 (k=9, k²=81):
-  //   naïve:  307 200 × 81  ≈ 25 M comparisons
-  //   sep:    307 200 × 18  ≈  5.5 M comparisons  (~4.5× faster)
+  // Pass 1 uses the van Herk / Gil-Werman O(n) sliding-window maximum,
+  // replacing the naive O(n·k) inner loop.  For k=9 this saves ~3× work.
   //
-  // NMS condition: keep pixel iff score == local_max (i.e. ≥ local_max,
-  // since local_max is computed over a window that includes the pixel itself).
+  // Algorithm: divide each row into blocks of k.  Compute prefix-max (left→
+  // right within each block) into nms_prefix, and suffix-max (right→left)
+  // into maxpool (safe temp: overwritten in Pass 2).  Combine:
+  //   row_max[x] = max(suffix[max(0,x−r)], prefix[min(W−1,x+r)])
+  //
+  // Pass 2 keeps the naive O(k) vertical sweep (column-strided reads are
+  // cache-unfriendly regardless of algorithm, so the win is smaller).
   // =========================================================================
   const int r = prop->nms_radius;
+  const int k = 2 * r + 1;
 
-  // Pass 1 — horizontal: row_max[y][x] = max(score_map[y][x-r .. x+r])
-  // //#pragma omp parallel for schedule(static)
+  // Pass 1 — horizontal (van Herk, O(n)):
+  // maxpool is borrowed as suffix temp; it is fully overwritten in Pass 2.
+  float* pre = prop->nms_prefix.data();
+  float* suf = maxpool;
+  #pragma omp parallel for schedule(static)
   for (int y = 0; y < H; ++y) {
     const float* src = score_map + y * W;
     float*       dst = row_max   + y * W;
+    float*       p   = pre + y * W;
+    float*       s   = suf + y * W;
+
+    // forward: prefix-max within each block of k
+    for (int x = 0; x < W; ++x)
+      p[x] = (x % k == 0) ? src[x] : std::max(p[x-1], src[x]);
+
+    // backward: suffix-max within each block of k
+    for (int x = W-1; x >= 0; --x)
+      s[x] = ((x+1) % k == 0 || x == W-1) ? src[x] : std::max(src[x], s[x+1]);
+
+    // combine into row_max
     for (int x = 0; x < W; ++x) {
-      float m = 0.f;
-      const int x0 = x - r < 0     ? 0     : x - r;
-      const int x1 = x + r >= W    ? W - 1 : x + r;
-      for (int xx = x0; xx <= x1; ++xx)
-        if (src[xx] > m) m = src[xx];
-      dst[x] = m;
+      const int l  = x - r < 0     ? 0     : x - r;
+      const int rr = x + r >= W    ? W - 1 : x + r;
+      dst[x] = std::max(s[l], p[rr]);
     }
   }
 
   // Pass 2 — vertical: maxpool[y][x] = max(row_max[y-r .. y+r][x])
-  // //#pragma omp parallel for schedule(static)
+  #pragma omp parallel for schedule(static)
   for (int y = 0; y < H; ++y) {
     float*    dst = maxpool + y * W;
     const int y0  = y - r < 0     ? 0     : y - r;
@@ -270,6 +288,7 @@ try {
   }
 
   // Suppress non-maxima
+  #pragma omp parallel for schedule(static)
   for (int i = 0; i < H * W; ++i)
     score_map[i] = score_map[i] >= maxpool[i] ? score_map[i] : 0.f;
 
@@ -316,6 +335,7 @@ try {
   std::vector<float> scores_out(N);
   std::vector<float> descs(N * DESC_DIM);
 
+  #pragma omp parallel for schedule(static)
   for (int i = 0; i < N; ++i) {
     kpts[i * 2 + 0] = static_cast<float>(cands[i].x);
     kpts[i * 2 + 1] = static_cast<float>(cands[i].y);

@@ -51,7 +51,7 @@ pipeline:
         - superpoint-decoder:
             detection_threshold: 0.005
             remove_borders: 4
-            max_keypoints: 1024   # set to -1 for unlimited keypoints
+            max_keypoints: 512    # set to -1 for unlimited keypoints
             nms_radius: 4         # max-pool NMS suppression radius in pixels
 
 operators:

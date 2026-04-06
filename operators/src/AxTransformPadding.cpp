@@ -6,8 +6,10 @@
 #include "AxMeta.hpp"
 #include "AxOpUtils.hpp"
 
+#include <cstring>
 #include <optional>
 
+#include <arm_neon.h>
 #include <opencv2/core/ocl.hpp>
 
 namespace
@@ -128,7 +130,8 @@ transform(const AxDataInterface &input, const AxDataInterface &output,
     const padding_properties *prop, unsigned int, unsigned int,
     std::unordered_map<std::string, std::unique_ptr<AxMetaBase>> &, Ax::Logger &logger)
 {
-  cv::ocl::setUseOpenCL(false);
+  static const bool opencl_disabled = (cv::ocl::setUseOpenCL(false), true);
+  (void)opencl_disabled;
 
   auto input_tensors = std::get<AxTensorsInterface>(input);
   auto output_tensors = std::get<AxTensorsInterface>(output);
@@ -147,10 +150,95 @@ transform(const AxDataInterface &input, const AxDataInterface &output,
     if (info.is_crop) {
       input_mat(info.ranges).copyTo(output_mat);
     } else {
-      if (prop->fill) {
-        output_mat.setTo(*prop->fill);
+      // Fast path: single-channel input expanded to N≥16 channels via padding.
+      // Replaces memset+strided-copyTo (two passes, write-allocate per pixel)
+      // with one pass writing full 64-byte-aligned cache lines via NEON.
+      // Condition: no reshape (in/out_shape not set), C_in==1, C_out≥16 and
+      // divisible by 16, non-negative fill, at least 3 effective dimensions.
+      const int ndim = static_cast<int>(info.out_sizes.size());
+      const bool use_neon_fast_path =
+          prop->fill &&
+          prop->in_shape.empty() &&
+          prop->out_shape.empty() &&
+          ndim >= 3 &&
+          info.in_sizes.back() == 1 &&
+          info.out_sizes.back() >= 16 &&
+          (info.out_sizes.back() % 16) == 0;
+
+      if (use_neon_fast_path) {
+        const int C_out  = info.out_sizes[ndim - 1];
+        const int W_out  = info.out_sizes[ndim - 2];
+        const int H_out  = info.out_sizes[ndim - 3];
+        const int H_in   = info.in_sizes [ndim - 3];
+        const int W_in   = info.in_sizes [ndim - 2];
+        const int h_pad  = info.ranges   [ndim - 3].start;
+        const int w_pad  = info.ranges   [ndim - 2].start;
+
+        // Leading batch dimensions (product of all dims before H,W,C).
+        int n_batch = 1;
+        for (int d = 0; d < ndim - 3; ++d) n_batch *= info.out_sizes[d];
+
+        const uint8_t fill_u8 = static_cast<uint8_t>(
+            static_cast<int8_t>(*prop->fill));
+        const uint8x16_t fill16 = vdupq_n_u8(fill_u8);
+        const int neon_vecs     = C_out / 16;   // NEON vectors per cell
+
+        const uint8_t* src_base = static_cast<const uint8_t*>(input_tensors[i].data);
+        uint8_t*       dst_base = static_cast<uint8_t*>(output_tensors[i].data);
+        const std::size_t row_stride = static_cast<std::size_t>(W_out) * C_out;
+
+        for (int b = 0; b < n_batch; ++b) {
+          const uint8_t* src_b = src_base + b * H_in * W_in;
+          uint8_t*       dst_b = dst_base + b * H_out * W_out * C_out;
+
+          // Top border rows — fill only
+          if (h_pad > 0)
+            std::memset(dst_b, fill_u8, static_cast<std::size_t>(h_pad) * row_stride);
+
+          for (int h = 0; h < H_in; ++h) {
+            const uint8_t* src_row = src_b + h * W_in;
+            uint8_t* dst_row = dst_b + static_cast<std::size_t>(h + h_pad) * row_stride;
+
+            // Left border cols — fill only
+            if (w_pad > 0)
+              std::memset(dst_row, fill_u8, static_cast<std::size_t>(w_pad) * C_out);
+
+            // Image cells: write [pixel, fill×(C_out-1)] per cell in one pass.
+            // Each cell is exactly C_out bytes; writing all bytes in one shot
+            // avoids the read-for-ownership penalty of the single-byte copyTo.
+            uint8_t* dst_img = dst_row + static_cast<std::size_t>(w_pad) * C_out;
+            for (int w = 0; w < W_in; ++w) {
+              uint8_t* cell = dst_img + w * C_out;
+              uint8x16_t v0 = fill16;
+              v0 = vsetq_lane_u8(src_row[w], v0, 0);  // channel 0 = pixel
+              vst1q_u8(cell, v0);
+              for (int v = 1; v < neon_vecs; ++v)
+                vst1q_u8(cell + v * 16, fill16);
+            }
+
+            // Right border cols — fill only
+            const int right_pad = W_out - w_pad - W_in;
+            if (right_pad > 0)
+              std::memset(dst_img + static_cast<std::size_t>(W_in) * C_out,
+                          fill_u8,
+                          static_cast<std::size_t>(right_pad) * C_out);
+          }
+
+          // Bottom border rows — fill only
+          const int bot_pad = H_out - h_pad - H_in;
+          if (bot_pad > 0)
+            std::memset(dst_b + static_cast<std::size_t>(h_pad + H_in) * row_stride,
+                        fill_u8,
+                        static_cast<std::size_t>(bot_pad) * row_stride);
+        }
+      } else {
+        if (prop->fill) {
+          std::memset(output_tensors[i].data,
+              static_cast<unsigned char>(static_cast<uint8_t>(*prop->fill)),
+              output_mat.total() * output_mat.elemSize());
+        }
+        input_mat.copyTo(output_mat(info.ranges));
       }
-      input_mat.copyTo(output_mat(info.ranges));
     }
   }
 }
